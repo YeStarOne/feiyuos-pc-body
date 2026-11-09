@@ -620,16 +620,17 @@ def tool_gen_image(args):
     if err:
         return {'ok': False, 'reason': err}
 
-    if seed is None:
-        seed = _next_seed(count)
-    seeds = [int(seed) + i for i in range(count)]
-
-    now = datetime.now()
-    batch_dir = OUT_BASE / ('%s_%s' % (now.strftime('%m%d'), _slug(subject)))
-    raw_dir = batch_dir / 'raw'
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    # seed 分配与批次目录建在**全闸通过之后**(1110 夜教训: 拒单调用白烧 seed 段
+    # 且会留空目录; seed 段要和真实成图一一对应, 台账按 seed 审计)。
+    def _alloc():
+        s = int(seed) if seed is not None else _next_seed(count)
+        bd = OUT_BASE / ('%s_%s' % (datetime.now().strftime('%m%d'), _slug(subject)))
+        (bd / 'raw').mkdir(parents=True, exist_ok=True)
+        return [s + i for i in range(count)], bd
 
     if FAKE:
+        seeds, batch_dir = _alloc()
+        raw_dir = batch_dir / 'raw'
         for s in seeds:
             _fake_png(raw_dir / ('fyi_%d_%06d.png' % (s, s)), subject + str(s))
         n_ok, fails = strip_gate(raw_dir, batch_dir)
@@ -651,6 +652,7 @@ def tool_gen_image(args):
         if not ok_comfy:
             _ledger({'tool': 'gen_image', 'ok': False, 'reject': why})
             return {'ok': False, 'reason': why}
+    seeds, batch_dir = _alloc()
     try:
         payload = render_batch(pos, neg, batch_dir, seeds)
         q = comfy_queue_count()
