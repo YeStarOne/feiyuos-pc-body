@@ -76,29 +76,36 @@ _LAST_GEN_TS = [0.0]                             # [可变] 上次成功出单�
 # 重连 LoRA 必须"原位换"或显式点名, 否则 FaceDetailer 拿旧模型会把脸换成另一个人)。
 # 触发词/权重/外观锚出处: 《Ds娘的日常》复刻档案(ref01 全对版), 权重 0.9 沿用已验证配方。
 TAIL_LORA_NODE = '900'
-# 大肥鱼(DS娘)两套预设**分开接线分开画**(用户 1110 拍板: "女仆和q版应该分开"):
-#   fish_q    = Q版二头身本体(她的角色卡形态) —— Q版 LoRA + chibi 锚
-#   fish_maid = 女仆原版(正常比例)          —— 作者原版 LoRA, 无 chibi
-# 共同: 鲸尾是硬识别点(用户点名"没有尾巴"), 两套锚都带 (big whale tail:1.3)。
-# 触发词/权重出处《Ds娘的日常》复刻档案: Q版=ds_whalemaid, 原版=deepseek_whale_girl+deepseek_maid_outfit, 0.9。
+# 大肥鱼(DS娘)两套预设**分开接线分开画**(用户 1110 拍板: "女仆和q版应该分开",
+# 二次纠正: "Q版要专门用Q版lora生成, 女仆是有星星尾巴的那个"):
+#   fish_q    = Q版二头身本体 —— Q版大肥鱼ds_whalemaid(触发 ds_whalemaid, 47 张数据集)
+#   fish_maid = 女仆原版      —— 女仆大肥鱼DeepseekChan_illust(触发 deepseekchan,
+#                                153 张全角色数据集: blue_hair/whale_fin_ears/gradient_hair,
+#                                星星尾巴)。⚠ ds_whalemaid.safetensors 与 Q版是同物异名拷贝
+#                                (metadata output_name/尺寸/tag 全同), 别当女仆版用(1110 实锤)。
+# 触发词/权重出处《Ds娘的日常》复刻档案, 0.9 起步。
 CHARACTER_PRESETS = {
     'fish_q': {
         'match': ('q版', 'chibi', '二头身'),
         'lora': 'Q版大肥鱼ds_whalemaid.safetensors',
         'strength': 0.9,
         'trigger': 'ds_whalemaid',
+        # 锚对齐用户给的标准像(1110): 圆头二头身/波浪长发/围裙鲸鱼徽章/白蕾丝短袜
         'anchors': ('(chibi:1.35), (two-heads-tall proportion:1.3), whale fin ears, '
-                    'ahoge, dark blue hair, blue gradient hair tips, '
-                    '(big whale tail:1.3), maid dress, whale print apron, blue bow, '
-                    'big blue eyes, '),
+                    'ahoge, (long wavy hair:1.15), dark blue hair, blue gradient hair tips, '
+                    '(big whale tail:1.3), maid dress, (whale print apron:1.15), blue bow, '
+                    'blue bows in hair, big blue eyes, white frilled ankle socks, '
+                    'mary janes, '),
     },
     'fish_maid': {
         'match': ('女仆', 'maid version', 'maid ver'),
-        'lora': 'ds_whalemaid.safetensors',
+        'lora': '女仆大肥鱼DeepseekChan_illust.safetensors',
         'strength': 0.9,
-        'trigger': 'deepseek_whale_girl, deepseek_maid_outfit',
-        'anchors': ('whale fin ears, ahoge, dark blue hair, blue gradient hair tips, '
-                    '(big whale tail:1.3), maid dress, whale print apron, blue bow, '
+        'trigger': 'deepseekchan',
+        # 锚对齐标准像: 黑白女仆装+白色过膝袜+星月纹大鲸尾(星星尾巴是她的硬识别点)
+        'anchors': ('whale fin ears, ahoge, (long wavy hair:1.15), dark blue hair, '
+                    'blue gradient hair tips, (big whale tail with star pattern:1.3), '
+                    'maid dress with white apron, white thighhighs, black bow, '
                     'big blue eyes, '),
     },
 }

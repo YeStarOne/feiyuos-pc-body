@@ -262,7 +262,7 @@ class T7FishPreset(unittest.TestCase):
         for s in ('大肥鱼女仆版', '女仆 fish girl', 'maid version standing'):
             key, p = M.match_preset(s)
             self.assertEqual(key, 'fish_maid', s)
-            self.assertEqual(p['trigger'], 'deepseek_whale_girl, deepseek_maid_outfit')
+            self.assertEqual(p['trigger'], 'deepseekchan')
 
     def test_no_match_keeps_tail(self):
         self.assertIsNone(M.match_preset('white dress girl in garden')[0])
@@ -286,11 +286,11 @@ class T7FishPreset(unittest.TestCase):
         self.assertEqual(tail['strength_model'], 0.9)
         self.assertEqual(api['3']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
         self.assertEqual(api['176']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
-        # 女仆版换的是另一个文件
+        # 女仆版换的是另一个文件(DeepseekChan 星星尾巴女仆; ds_whalemaid 是 Q版拷贝别用)
         _k2, p2 = M.match_preset('女仆版')
         api2 = M.build_api('POS', M.NEG_FIXED, 109011, 'maidbatch', preset=p2)
         self.assertEqual(api2[M.TAIL_LORA_NODE]['inputs']['lora_name'],
-                         'ds_whalemaid.safetensors')
+                         '女仆大肥鱼DeepseekChan_illust.safetensors')
         # 不换时保持模板原样(rossi)
         api3 = M.build_api('POS', M.NEG_FIXED, 109012, 'plainbatch')
         self.assertIn('rossi', api3[M.TAIL_LORA_NODE]['inputs']['lora_name'])
