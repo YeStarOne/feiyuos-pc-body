@@ -114,7 +114,7 @@ class T3Gates(unittest.TestCase):
 
 class T4Compose(unittest.TestCase):
     def test_head_and_art_present(self):
-        pos, neg, err = M.compose('white dress girl in garden')
+        pos, neg, err, _pk = M.compose('white dress girl in garden')
         self.assertIsNone(err)
         self.assertTrue(pos.startswith(M.HEAD))
         self.assertIn('artist:tianliang duohe fangdongye', pos)
@@ -123,14 +123,14 @@ class T4Compose(unittest.TestCase):
 
     def test_length_degrade_drops_scene_first(self):
         long_scene = 'extremely detailed ' * 40
-        pos, _neg, err = M.compose('white dress girl', scene=long_scene.strip())
+        pos, _neg, err, _pk = M.compose('white dress girl', scene=long_scene.strip())
         self.assertIsNone(err)
         self.assertLessEqual(len(pos), M.LIMIT)
         self.assertNotIn('extremely detailed', pos)      # 整段场景被降级删掉
 
     def test_pos_rechecked(self):
         # subject 过了闸但 outfit 里塞 R18 词 → 拼完复查要拦下
-        pos, _neg, err = M.compose('cute girl', outfit='nude swimsuit')
+        pos, _neg, err, _pk = M.compose('cute girl', outfit='nude swimsuit')
         self.assertIsNone(pos)
         self.assertIn('拒单', err)
 
@@ -246,6 +246,54 @@ class T6BuildApi(unittest.TestCase):
         self.assertIn('176', api)
         # 负向 nsfw 保险必须在(非 R18 第一道)
         self.assertIn('nsfw', api['153']['inputs']['text'])
+
+
+class T7FishPreset(unittest.TestCase):
+    """大肥鱼两套预设分开: Q版(chibi+Q LoRA) / 女仆(原版 LoRA), 鲸尾都在锚里。"""
+
+    def test_match_q_keywords(self):
+        for s in ('q版大肥鱼', 'chibi fish girl', '二头身鱼娘', '肥鱼在打游戏',
+                  'ds娘 sitting', 'whale maid girl', 'whalemaid mascot'):
+            key, p = M.match_preset(s)
+            self.assertEqual(key, 'fish_q', s)
+            self.assertEqual(p['trigger'], 'ds_whalemaid')
+
+    def test_match_maid_keywords(self):
+        for s in ('大肥鱼女仆版', '女仆 fish girl', 'maid version standing'):
+            key, p = M.match_preset(s)
+            self.assertEqual(key, 'fish_maid', s)
+            self.assertEqual(p['trigger'], 'deepseek_whale_girl, deepseek_maid_outfit')
+
+    def test_no_match_keeps_tail(self):
+        self.assertIsNone(M.match_preset('white dress girl in garden')[0])
+
+    def test_compose_injects_trigger_and_anchors(self):
+        pos, neg, err, pk = M.compose('whale maid girl eating snacks at her desk')
+        self.assertIsNone(err)
+        self.assertEqual(pk, 'fish_q')
+        self.assertIn('ds_whalemaid', pos)
+        self.assertIn('(big whale tail:1.3)', pos)      # 鲸尾是硬识别点
+        self.assertIn('(chibi:1.35)', pos)
+        self.assertLessEqual(len(pos), M.LIMIT)
+
+    def test_build_api_swaps_tail_lora(self):
+        if not M.TEMPLATE_PNG.exists():
+            self.skipTest('模板 PNG 不在本机')
+        _k, p = M.match_preset('q版大肥鱼')
+        api = M.build_api('POS', M.NEG_FIXED, 109010, 'fishbatch', preset=p)
+        tail = api[M.TAIL_LORA_NODE]['inputs']
+        self.assertEqual(tail['lora_name'], 'Q版大肥鱼ds_whalemaid.safetensors')
+        self.assertEqual(tail['strength_model'], 0.9)
+        self.assertEqual(api['3']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
+        self.assertEqual(api['176']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
+        # 女仆版换的是另一个文件
+        _k2, p2 = M.match_preset('女仆版')
+        api2 = M.build_api('POS', M.NEG_FIXED, 109011, 'maidbatch', preset=p2)
+        self.assertEqual(api2[M.TAIL_LORA_NODE]['inputs']['lora_name'],
+                         'ds_whalemaid.safetensors')
+        # 不换时保持模板原样(rossi)
+        api3 = M.build_api('POS', M.NEG_FIXED, 109012, 'plainbatch')
+        self.assertIn('rossi', api3[M.TAIL_LORA_NODE]['inputs']['lora_name'])
 
 
 if __name__ == '__main__':

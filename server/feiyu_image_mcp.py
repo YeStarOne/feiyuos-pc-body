@@ -69,6 +69,53 @@ MAX_COUNT = 4
 MIN_SEND_INTERVAL = 3.0                          # os 约定: QQ 连发间隔≥3s(风控); 模块侧对 gen_image 调用节流
 _LAST_GEN_TS = [0.0]                             # [可变] 上次成功出单时刻
 
+# ── 角色预设(尾位 LoRA 原位换名 = 零改线) ─────────────────────────────
+# 模板 LoRA 链: 175 Expressive_H → 188 contrast → 189 brightness → 193 saturation
+#   → 192 realistic_cum → **900 角色槽**(3/KSampler、176脸、142手 全吃它的输出)。
+# 命中关键词就把 900 原位换 lora_name+权重 —— 下游全部自动继承(1103 教训:
+# 重连 LoRA 必须"原位换"或显式点名, 否则 FaceDetailer 拿旧模型会把脸换成另一个人)。
+# 触发词/权重/外观锚出处: 《Ds娘的日常》复刻档案(ref01 全对版), 权重 0.9 沿用已验证配方。
+TAIL_LORA_NODE = '900'
+# 大肥鱼(DS娘)两套预设**分开接线分开画**(用户 1110 拍板: "女仆和q版应该分开"):
+#   fish_q    = Q版二头身本体(她的角色卡形态) —— Q版 LoRA + chibi 锚
+#   fish_maid = 女仆原版(正常比例)          —— 作者原版 LoRA, 无 chibi
+# 共同: 鲸尾是硬识别点(用户点名"没有尾巴"), 两套锚都带 (big whale tail:1.3)。
+# 触发词/权重出处《Ds娘的日常》复刻档案: Q版=ds_whalemaid, 原版=deepseek_whale_girl+deepseek_maid_outfit, 0.9。
+CHARACTER_PRESETS = {
+    'fish_q': {
+        'match': ('q版', 'chibi', '二头身'),
+        'lora': 'Q版大肥鱼ds_whalemaid.safetensors',
+        'strength': 0.9,
+        'trigger': 'ds_whalemaid',
+        'anchors': ('(chibi:1.35), (two-heads-tall proportion:1.3), whale fin ears, '
+                    'ahoge, dark blue hair, blue gradient hair tips, '
+                    '(big whale tail:1.3), maid dress, whale print apron, blue bow, '
+                    'big blue eyes, '),
+    },
+    'fish_maid': {
+        'match': ('女仆', 'maid version', 'maid ver'),
+        'lora': 'ds_whalemaid.safetensors',
+        'strength': 0.9,
+        'trigger': 'deepseek_whale_girl, deepseek_maid_outfit',
+        'anchors': ('whale fin ears, ahoge, dark blue hair, blue gradient hair tips, '
+                    '(big whale tail:1.3), maid dress, whale print apron, blue bow, '
+                    'big blue eyes, '),
+    },
+}
+DEFAULT_PRESET = 'fish_q'                        # 光说"肥鱼/ds娘"= 她本体(Q版)
+DEFAULT_PRESET_KEYWORDS = ('肥鱼', '鱼娘', 'ds娘', 'whalemaid', 'whale maid',
+                           'whale girl', 'deepseek whale', 'ds-chan')
+
+
+def match_preset(text):
+    t = (text or '').lower()
+    for key, p in CHARACTER_PRESETS.items():
+        if any(m.lower() in t for m in p['match']):
+            return key, p
+    if any(m.lower() in t for m in DEFAULT_PRESET_KEYWORDS):
+        return DEFAULT_PRESET, CHARACTER_PRESETS[DEFAULT_PRESET]
+    return None, None
+
 # ── 画风基线(钉死) ────────────────────────────────────────
 HEAD = '(solo:1.25), 1girl, '
 ART = ('(artist:tianliang duohe fangdongye:0.9), artist:ciloranko, artist:noyu, '
@@ -163,26 +210,32 @@ def check_request(subject, outfit='', scene=''):
     return None
 
 
-def compose(subject, outfit='', scene=''):
+def compose(subject, outfit='', scene='', preset_key=None):
     """拼正向(照美图线 build(): HEAD+ART+outfit+subject+', '+scene) 与固定负向。
 
+    命中角色预设时, 触发词+外观锚插在 ART 之后(角色锚位), subject 仍是核心。
     长度降级梯只砍场景再砍服装(基线定案: 超长删场景, 不加加权); subject 是核心永不砍,
     砍完仍超限返回 None。双保险: 拼完再过一遍 R18 词检查(防上游漏网)。
     """
     subject = ' '.join((subject or '').split())
     outfit = ' '.join((outfit or '').split())
     scene = ' '.join((scene or '').split())
-    core = (HEAD + ART + (outfit + ' ' if outfit else '') + subject).strip()
+    _key, preset = match_preset(subject + ' ' + outfit)
+    if preset_key and preset_key in CHARACTER_PRESETS:
+        _key, preset = preset_key, CHARACTER_PRESETS[preset_key]
+    char_block = ('' + preset['trigger'] + ', ' + preset['anchors']) if preset else ''
+    core = (HEAD + ART + char_block
+            + (outfit + ' ' if outfit else '') + subject).strip()
     core = re.sub(r'\s*,\s*', ', ', core).rstrip(', ')
     if len(core) > LIMIT:
-        return None, None, '描述过长(%d 字, 上限 %d): 请精简 subject' % (len(core), LIMIT)
+        return None, None, '描述过长(%d 字, 上限 %d): 请精简 subject' % (len(core), LIMIT), None
     pos = (core + (', ' + scene if scene else '')).rstrip(', ')
     if len(pos) > LIMIT:
         pos = core                                   # 降级: 整段场景删掉
     bad = check_request(pos)
     if bad:
-        return None, None, bad
-    return pos, NEG_FIXED, None
+        return None, None, bad, None
+    return pos, NEG_FIXED, None, (_key if preset else None)
 
 
 # ══ 洗图硬闸(M2 先行) ═══════════════════════════════════════
@@ -475,14 +528,18 @@ def _post(path, payload, timeout=30):
         return json.loads(r.read().decode('utf-8'))
 
 
-def build_api(pos, neg, seed, batch_name):
-    """从模板 PNG 载入节点图并按美图档接线。返回完整 api dict。"""
+def build_api(pos, neg, seed, batch_name, preset=None):
+    """从模板 PNG 载入节点图并按美图档接线。命中角色预设时尾位 LoRA(node 900)原位换名。"""
     from PIL import Image
     with Image.open(TEMPLATE_PNG) as im:
         api = json.loads(im.text['prompt'])
     api['165']['inputs']['text'] = pos
     api['153']['inputs']['text'] = neg
     api['17']['inputs']['denoise'] = 0.55          # 美图档(比插入拍多给重画)
+    if preset:
+        api[TAIL_LORA_NODE]['inputs']['lora_name'] = preset['lora']
+        api[TAIL_LORA_NODE]['inputs']['strength_model'] = preset['strength']
+        api[TAIL_LORA_NODE]['inputs']['strength_clip'] = preset['strength']
     api['301'] = {'class_type': 'CLIPTextEncode',
                   'inputs': {'text': pos + HAND_POS,
                              'clip': list(api['165']['inputs']['clip'])}}
@@ -526,7 +583,7 @@ def _wait_file(prompt_id, seed, batch_dir, timeout=RENDER_TIMEOUT):
     return None
 
 
-def render_batch(pos, neg, batch_dir, seeds):
+def render_batch(pos, neg, batch_dir, seeds, preset=None):
     """真渲染: 逐 seed 提交+轮询落盘 → 原图挪 raw/ → 洗图硬闸 → 返回洗净路径。
 
     出错语义: 任一 seed 失败即返回 ok:false(已成的图仍在 batch_dir/raw/ 不外传)。
@@ -536,7 +593,7 @@ def render_batch(pos, neg, batch_dir, seeds):
     raw_dir.mkdir(parents=True, exist_ok=True)
     moved = []
     for s in seeds:
-        api = build_api(pos, neg, s, batch_dir.name)
+        api = build_api(pos, neg, s, batch_dir.name, preset=preset)
         try:
             r = _post('/prompt', {'prompt': api, 'client_id': CLIENT_ID})
         except Exception as e:                     # noqa
@@ -616,9 +673,10 @@ def tool_gen_image(args):
         _ledger({'tool': 'gen_image', 'ok': False, 'reject': why})
         return {'ok': False, 'reason': why}
 
-    pos, neg, err = compose(subject, outfit, scene)
+    pos, neg, err, preset_key = compose(subject, outfit, scene)
     if err:
         return {'ok': False, 'reason': err}
+    _preset = CHARACTER_PRESETS.get(preset_key) if preset_key else None
 
     # seed 分配与批次目录建在**全闸通过之后**(1110 夜教训: 拒单调用白烧 seed 段
     # 且会留空目录; seed 段要和真实成图一一对应, 台账按 seed 审计)。
@@ -654,7 +712,7 @@ def tool_gen_image(args):
             return {'ok': False, 'reason': why}
     seeds, batch_dir = _alloc()
     try:
-        payload = render_batch(pos, neg, batch_dir, seeds)
+        payload = render_batch(pos, neg, batch_dir, seeds, preset=_preset)
         q = comfy_queue_count()
         if q == 0:
             comfy_free()
