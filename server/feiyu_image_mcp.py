@@ -66,6 +66,8 @@ VRAM_MIN_GB = 9.0                                # SDXL 全链常驻约 8.1GB(AG
 LIMIT = 750                                      # 正向硬闸(美图线定案)
 STYLE_ENUM = ('coco_linglan_1108',)              # 对她不开放自由文本; 内部预留
 MAX_COUNT = 4
+MIN_SEND_INTERVAL = 3.0                          # os 约定: QQ 连发间隔≥3s(风控); 模块侧对 gen_image 调用节流
+_LAST_GEN_TS = [0.0]                             # [可变] 上次成功出单时刻
 
 # ── 画风基线(钉死) ────────────────────────────────────────
 HEAD = '(solo:1.25), 1girl, '
@@ -436,7 +438,7 @@ def ensure_comfy():
     return False, 'ComfyUI 启动超时(%ds)' % COMFY_START_TIMEOUT
 
 
-# ══ 渲染(M4 接入; 骨架先立) ═════════════════════════════════
+# ══ 渲染(真通道) ═════════════════════════════════════════════
 def _next_seed(count):
     used = 0
     try:
@@ -448,14 +450,115 @@ def _next_seed(count):
     return start
 
 
-def render_batch(pos, neg, batch_dir, seeds):
-    """真渲染: 提交 xufufu 模板(节点165/153/17dn0.55/176/142/77) + 轮询落盘。
+# 模板源 = 美图66 批成品 PNG 内嵌节点图(同 coco 全链; ⚠不要用 R18 批当源——
+# 它的负向已拆 nsfw)。接线照 gen_suzuran_beauty_1110.make_api 通用化:
+#   165/153 换文本, 17 dn0.55, 301/302 手部细节器新词, 142←301/302, 77←142;
+#   脸细节器 176 在模板里已引用 165/153, 换文本自动继承, 不用重接。
+TEMPLATE_PNG = Path(r'G:\生图工作盘\ComfyUI_output\CunnyFunky\铃兰_美图66_1109'
+                    r'\szb_001_875000_00001_.png')
+SEED_NODES = ('3', '17', '142', '176')
+CLIENT_ID = 'feiyu-image-mcp'
+RENDER_TIMEOUT = 600                              # 单张轮询上限(秒)
+HAND_POS = (', perfect hands, detailed fingers, five fingers on each hand, '
+            'natural hand shape')
+HAND_NEG = (', fused fingers, too many fingers, missing fingers, extra digits, '
+            'malformed hands, (toes:1.2), (feet instead of hands:1.2)')
 
-    ⚠ M4 实现(今晚不跑真渲染, 直播占卡)。接入要点已定:
-      模板源 = 铃兰美图批成品 PNG 内嵌节点图(同 coco 全链), dn 0.55 美图档,
-      filename_prefix=<批次>/<pfx>_<seed>, SEED_NODES=['3','17','142','176']。
+
+def _post(path, payload, timeout=30):
+    import urllib.request
+    req = urllib.request.Request(
+        COMFY_URL + path,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def build_api(pos, neg, seed, batch_name):
+    """从模板 PNG 载入节点图并按美图档接线。返回完整 api dict。"""
+    from PIL import Image
+    with Image.open(TEMPLATE_PNG) as im:
+        api = json.loads(im.text['prompt'])
+    api['165']['inputs']['text'] = pos
+    api['153']['inputs']['text'] = neg
+    api['17']['inputs']['denoise'] = 0.55          # 美图档(比插入拍多给重画)
+    api['301'] = {'class_type': 'CLIPTextEncode',
+                  'inputs': {'text': pos + HAND_POS,
+                             'clip': list(api['165']['inputs']['clip'])}}
+    api['302'] = {'class_type': 'CLIPTextEncode',
+                  'inputs': {'text': neg + HAND_NEG,
+                             'clip': list(api['153']['inputs']['clip'])}}
+    api['142']['inputs']['positive'] = ['301', 0]
+    api['142']['inputs']['negative'] = ['302', 0]
+    api['142']['inputs']['denoise'] = 0.55
+    api['142']['inputs']['cycle'] = 1
+    api['77']['inputs']['images'] = ['142', 0]
+    api['77']['inputs']['filename_prefix'] = '肥鱼OS/%s/fyi_%d' % (batch_name, seed)
+    for n in SEED_NODES:
+        api[n]['inputs']['seed'] = seed
+    return api
+
+
+def _wait_file(prompt_id, seed, batch_dir, timeout=RENDER_TIMEOUT):
+    """轮询 /history 直到 77 节点出文件并落盘, 返回文件 Path 或 None。"""
+    import urllib.request
+    deadline = time.time() + timeout
+    want = batch_dir / ('fyi_%d_*.png' % seed)
+    while time.time() < deadline:
+        time.sleep(4)
+        try:
+            with urllib.request.urlopen(COMFY_URL + '/history/' + prompt_id,
+                                        timeout=10) as r:
+                hist = json.loads(r.read().decode('utf-8'))
+        except Exception:
+            continue
+        entry = hist.get(prompt_id)
+        if not entry:
+            continue
+        outs = (entry.get('outputs') or {}).get('77') or {}
+        if outs.get('images'):
+            hits = sorted(batch_dir.glob('fyi_%d_*.png' % seed))
+            if hits:
+                return hits[0]
+        # history 有记录但文件没落地 → 继续等(极端情况超时由 deadline 兜底)
+        _ = want                    # noqa: 占位保持意图可读
+    return None
+
+
+def render_batch(pos, neg, batch_dir, seeds):
+    """真渲染: 逐 seed 提交+轮询落盘 → 原图挪 raw/ → 洗图硬闸 → 返回洗净路径。
+
+    出错语义: 任一 seed 失败即返回 ok:false(已成的图仍在 batch_dir/raw/ 不外传)。
     """
-    raise NotImplementedError('真渲染 M4 接入(今晚联调只用 --fake)')
+    batch_dir = Path(batch_dir)
+    raw_dir = batch_dir / 'raw'
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for s in seeds:
+        api = build_api(pos, neg, s, batch_dir.name)
+        try:
+            r = _post('/prompt', {'prompt': api, 'client_id': CLIENT_ID})
+        except Exception as e:                     # noqa
+            return {'ok': False,
+                    'reason': '提交失败(seed %d): %s; 看 server/logs/comfy8188_*.log'
+                              % (s, str(e)[:160])}
+        pid = r.get('prompt_id')
+        if not pid:
+            return {'ok': False,
+                    'reason': '提交无 prompt_id: %s' % json.dumps(r, ensure_ascii=False)[:200]}
+        f = _wait_file(pid, s, batch_dir)
+        if f is None:
+            return {'ok': False,
+                    'reason': 'seed %d 渲染超时(%ds); ComfyUI 队列/日志自查' % (s, RENDER_TIMEOUT)}
+        dst = raw_dir / f.name
+        shutil.move(str(f), str(dst))
+        moved.append(dst.name)
+    n_ok, fails = strip_gate(raw_dir, batch_dir)
+    images = [str(batch_dir / p.name) for p in sorted(batch_dir.glob('*.png'))]
+    return {'ok': n_ok > 0, 'images': images, 'batch_dir': str(batch_dir),
+            'seeds': seeds, 'washed': n_ok,
+            'washed_fail': [x[0] for x in fails]}
 
 
 def _fake_png(path, hue_seed):
@@ -490,6 +593,10 @@ def _ledger(evt):
 
 
 def tool_gen_image(args):
+    gap = time.time() - _LAST_GEN_TS[0]
+    if _LAST_GEN_TS[0] and gap < MIN_SEND_INTERVAL:
+        return {'ok': False,
+                'reason': 'QQ 发图节流: 距上一单 %.1fs(需≥%ds), 请稍候再试' % (gap, MIN_SEND_INTERVAL)}
     subject = args.get('subject') or ''
     outfit = args.get('outfit') or ''
     scene = args.get('scene') or ''
@@ -600,7 +707,10 @@ TOOLS = [
 
 def dispatch(name, args):
     if name == 'gen_image':
-        return tool_gen_image(args or {})
+        payload = tool_gen_image(args or {})
+        if payload.get('ok'):
+            _LAST_GEN_TS[0] = time.time()
+        return payload
     if name == 'gen_image_status':
         return tool_gen_image_status(args or {})
     return {'ok': False, 'reason': '未知工具 %s' % name}
@@ -696,30 +806,26 @@ class McpHandler(BaseHTTPRequestHandler):
 _LOCK = HERE / 'feiyu_image_mcp.lock'
 
 
-def acquire_lock():
-    if _LOCK.exists():
-        try:
-            old = int(_LOCK.read_text(encoding='utf-8').strip() or 0)
-            os.kill(old, 0)
-            return False                           # 有活实例
-        except (ProcessLookupError, ValueError, PermissionError):
-            pass                                   # 残锁, 抢走
-    _LOCK.write_text(str(os.getpid()), encoding='utf-8')
-    return True
-
-
 def main(argv=None):
+    """单实例判重 = 端口绑定本身(WinError 10048 即已有实例)。
+
+    ⚠ 不要用 os.kill(pid, 0) 做 Windows 探活 —— 它在 Windows 语义是
+    TerminateProcess(撞 PID 会误杀真进程), 1110 夜实测踩坑。
+    锁文件只写当前 PID 供看门狗读, 不参与判重。
+    """
     global FAKE
     argv = sys.argv[1:] if argv is None else argv
     FAKE = '--fake' in argv
-    if not acquire_lock():
-        print('已有实例在跑(锁 %s), 退出' % _LOCK.name)
-        return 1
     LOG.mkdir(exist_ok=True)
     OUT_BASE.mkdir(parents=True, exist_ok=True)
-    srv = ThreadingHTTPServer(('127.0.0.1', PORT), McpHandler)
-    print('feiyu-image-mcp %s 监听 127.0.0.1:%d (fake=%s)'
-          % ('联调' if FAKE else '正式', PORT, FAKE), flush=True)
+    try:
+        srv = ThreadingHTTPServer(('127.0.0.1', PORT), McpHandler)
+    except OSError as e:
+        print('18082 绑定失败(已有实例在跑?): %s' % e, flush=True)
+        return 1
+    _LOCK.write_text(str(os.getpid()), encoding='utf-8')
+    print('feiyu-image-mcp %s 监听 127.0.0.1:%d (pid=%d)'
+          % ('联调' if FAKE else '正式', PORT, os.getpid()), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

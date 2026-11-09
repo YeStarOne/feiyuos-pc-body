@@ -190,6 +190,7 @@ class T5McpSmoke(unittest.TestCase):
         self.assertEqual(names, ['gen_image', 'gen_image_status'])
 
         # gen_image 假图全链: 闸 → 拼 → 占位 PNG → 洗图 → 返回洗净路径
+        M._LAST_GEN_TS[0] = 0.0                # 清节流(测试内连发)
         r = self.call({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
             'name': 'gen_image',
             'arguments': {'subject': 'white dress girl in garden, silver hair',
@@ -205,6 +206,7 @@ class T5McpSmoke(unittest.TestCase):
             self.assertNotIn(b'FAKE PROMPT', f.read_bytes())
 
         # 拒单走 MCP 也能拿到原因
+        M._LAST_GEN_TS[0] = 0.0
         r2 = self.call({'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {
             'name': 'gen_image', 'arguments': {'subject': 'nude girl'}}})
         p2 = json.loads(r2['result']['content'][0]['text'])
@@ -218,6 +220,32 @@ class T5McpSmoke(unittest.TestCase):
         self.assertTrue(p3['ok'])
         self.assertTrue(p3['fake_mode'])
         self.assertIsInstance(p3['today_batches'], list)
+
+
+class T6BuildApi(unittest.TestCase):
+    """真渲染接线单测: 只读模板 PNG 改节点, 不碰 GPU/服务器。"""
+
+    def test_wiring(self):
+        if not M.TEMPLATE_PNG.exists():
+            self.skipTest('模板 PNG 不在本机(其他机器跳过)')
+        api = M.build_api('TEST POS 白裙', M.NEG_FIXED, 109001, 'testbatch')
+        self.assertEqual(api['165']['inputs']['text'], 'TEST POS 白裙')
+        self.assertEqual(api['153']['inputs']['text'], M.NEG_FIXED)
+        self.assertEqual(api['17']['inputs']['denoise'], 0.55)
+        self.assertEqual(api['142']['inputs']['positive'], ['301', 0])
+        self.assertEqual(api['142']['inputs']['negative'], ['302', 0])
+        self.assertEqual(api['142']['inputs']['denoise'], 0.55)
+        self.assertEqual(api['77']['inputs']['images'], ['142', 0])
+        self.assertEqual(api['77']['inputs']['filename_prefix'],
+                         '肥鱼OS/testbatch/fyi_109001')
+        self.assertIn('perfect hands', api['301']['inputs']['text'])
+        self.assertIn('fused fingers', api['302']['inputs']['text'])
+        for n in M.SEED_NODES:
+            self.assertEqual(api[n]['inputs']['seed'], 109001, n)
+        # 脸细节器 176 仍在图中且引用完整(模板自带, 换文本自动继承)
+        self.assertIn('176', api)
+        # 负向 nsfw 保险必须在(非 R18 第一道)
+        self.assertIn('nsfw', api['153']['inputs']['text'])
 
 
 if __name__ == '__main__':
