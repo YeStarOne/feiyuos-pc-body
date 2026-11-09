@@ -93,20 +93,38 @@ CHARACTER_PRESETS = {
         # 锚对齐用户给的标准像(1110): 圆头二头身/波浪长发/围裙鲸鱼徽章/白蕾丝短袜
         'anchors': ('(chibi:1.35), (two-heads-tall proportion:1.3), whale fin ears, '
                     'ahoge, (long wavy hair:1.15), dark blue hair, blue gradient hair tips, '
-                    '(big whale tail:1.3), maid dress, (whale print apron:1.15), blue bow, '
+                    '(her whale tail attached to her lower back:1.3), '
+                    'maid dress, (whale print apron:1.15), blue bow, '
                     'blue bows in hair, big blue eyes, white frilled ankle socks, '
                     'mary janes, '),
     },
     'fish_maid': {
         'match': ('女仆', 'maid version', 'maid ver'),
         'lora': '女仆大肥鱼DeepseekChan_illust.safetensors',
-        'strength': 0.9,
+        # 1110 探针7 定档(g0/g1 同 seed 对照): sm1.0 + 176 脸重画压 0.3 —— 基线的
+        # 12 artist tag 画风层 + 176dn0.5 会把 LoRA 本脸洗成"风格脸"(用户实锤"脸不像");
+        # 克隆是 seed 彩票(109030 全克隆, 109031/109032 干净), 换 seed 修, 不靠负向。
+        'strength': 1.0,
+        'face_dn': 0.3,
         'trigger': 'deepseekchan',
-        # 锚对齐标准像: 黑白女仆装+白色过膝袜+星月纹大鲸尾(星星尾巴是她的硬识别点)
-        'anchors': ('whale fin ears, ahoge, (long wavy hair:1.15), dark blue hair, '
-                    'blue gradient hair tips, (big whale tail with star pattern:1.3), '
+        # 锚对齐标准像: 少女体型(用户 1110 实锤"体型不像, 应该是少女体型") + 黑白女仆
+        # +白色过膝袜+星月纹大鲸尾。该 LoRA 数据集自带"伴鲸"构图, 尾巴必须写成
+        # "从她腰后长出来"并配专属负向压背景鲸(见 neg_extra)。
+        'anchors': ('(petite:1.25), (young girl:1.2), (small breasts:1.15), '
+                    '(round face:1.15), '
+                    'whale fin ears, ahoge, (long wavy hair:1.15), dark blue hair, '
+                    'blue gradient hair tips, '
+                    '(her whale tail attached to her lower back:1.3), '
+                    '(starry navy whale tail:1.15), '
                     'maid dress with white apron, white thighhighs, black bow, '
                     'big blue eyes, '),
+        'neg_extra': ('(floating whale:1.3), (whale in background:1.3), '
+                      '(giant whale:1.2), (whale beside her:1.25), '
+                      '(from behind:1.3), (back view:1.3), (rear view:1.25)'),
+        # 复刻标准像的构图控制: 视角词压句尾(规则15, 句尾权重最大)。
+        # probe4 实锤: subject 里写 facing the viewer 会被背面构图稀释, 必须压句尾。
+        'pos_suffix': ('(facing the viewer:1.3), (looking at the viewer:1.25), '
+                       '(front view:1.2)'),
     },
 }
 DEFAULT_PRESET = 'fish_q'                        # 光说"肥鱼/ds娘"= 她本体(Q版)
@@ -540,15 +558,18 @@ def build_api(pos, neg, seed, batch_name, preset=None):
     from PIL import Image
     with Image.open(TEMPLATE_PNG) as im:
         api = json.loads(im.text['prompt'])
-    api['165']['inputs']['text'] = pos
-    api['153']['inputs']['text'] = neg
-    api['17']['inputs']['denoise'] = 0.55          # 美图档(比插入拍多给重画)
+    api['165']['inputs']['text'] = (pos + preset['pos_suffix']) if preset and preset.get('pos_suffix') else pos
+    neg_use = neg + preset['neg_extra'] if preset and preset.get('neg_extra') else neg
+    api['153']['inputs']['text'] = neg_use
+    api['17']['inputs']['denoise'] = (preset.get('dn17') or 0.55) if preset else 0.55
     if preset:
         api[TAIL_LORA_NODE]['inputs']['lora_name'] = preset['lora']
         api[TAIL_LORA_NODE]['inputs']['strength_model'] = preset['strength']
         api[TAIL_LORA_NODE]['inputs']['strength_clip'] = preset['strength']
+        if preset.get('face_dn'):                  # LoRA 角色: 压脸重画保脸型(探针定档后写死)
+            api['176']['inputs']['denoise'] = preset['face_dn']
     api['301'] = {'class_type': 'CLIPTextEncode',
-                  'inputs': {'text': pos + HAND_POS,
+                  'inputs': {'text': api['165']['inputs']['text'] + HAND_POS,
                              'clip': list(api['165']['inputs']['clip'])}}
     api['302'] = {'class_type': 'CLIPTextEncode',
                   'inputs': {'text': neg + HAND_NEG,
@@ -619,7 +640,10 @@ def render_batch(pos, neg, batch_dir, seeds, preset=None):
         shutil.move(str(f), str(dst))
         moved.append(dst.name)
     n_ok, fails = strip_gate(raw_dir, batch_dir)
-    images = [str(batch_dir / p.name) for p in sorted(batch_dir.glob('*.png'))]
+    # 只返回**本单 seed**的洗净图(批次目录会累积多次调用, 全量排序会发错图, 1110 实锤)
+    images = []
+    for s in seeds:
+        images.extend(str(p) for p in sorted(batch_dir.glob('fyi_%d_*.png' % s)))
     return {'ok': n_ok > 0, 'images': images, 'batch_dir': str(batch_dir),
             'seeds': seeds, 'washed': n_ok,
             'washed_fail': [x[0] for x in fails]}

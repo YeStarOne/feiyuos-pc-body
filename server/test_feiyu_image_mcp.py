@@ -272,7 +272,7 @@ class T7FishPreset(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(pk, 'fish_q')
         self.assertIn('ds_whalemaid', pos)
-        self.assertIn('(big whale tail:1.3)', pos)      # 鲸尾是硬识别点
+        self.assertIn('(her whale tail attached to her lower back:1.3)', pos)  # 鲸尾硬识别点
         self.assertIn('(chibi:1.35)', pos)
         self.assertLessEqual(len(pos), M.LIMIT)
 
