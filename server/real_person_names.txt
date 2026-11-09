@@ -1,0 +1,58 @@
+# 真人红线名单 —— 命中即拒单(声优/偶像/公众人物名字和形象一律不画)
+# 一行一个名字, 中文/日文汉字/罗马字都算; # 开头是注释。feiyu-os 侧可随时补。
+# 机制说明: check_request() 会把请求全文与名单做小写子串匹配。
+# 维护纪律: 漏了谁不怪名单, 补上就行; 宁多勿漏(拒单是安全侧)。
+花泽香菜
+花澤香菜
+hanazawa kana
+佐仓绫音
+佐倉綾音
+sakura ayane
+水濑祈
+水瀬いのり
+minase inori
+鬼头明里
+鬼頭明里
+kito akari
+早见沙织
+早見沙織
+hayami saori
+茅野爱衣
+茅野愛衣
+kayano ai
+悠木碧
+yuuki aoi
+东山奈央
+東山奈央
+toyama nao
+伊藤美来
+ito miku
+上坂堇
+上坂すみれ
+uesaka sumire
+内田真礼
+uchida maaya
+雨宫天
+amamiya sora
+种田梨沙
+种田梨紗
+taneda risa
+楠木灯
+楠木ともり
+kusunoki tomori
+高桥李依
+高橋李依
+takahashi rie
+小仓唯
+ogura yui
+日高里菜
+hidaka rina
+石见舞菜香
+石見舞菜香
+ishimi mika
+# — 中文圈公众人物示例(补到常用为止) —
+鞠婧祎
+程潇
+杨超越
+王冰冰
+蔡徐坤
