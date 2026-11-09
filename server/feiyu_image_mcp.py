@@ -756,6 +756,8 @@ TOOLS = [
      'description': '画一张(非 R18)动漫插画。固定使用团队已验证的画风基线(不可换风格)。'
                     '参数全部用英文 danbooru tag(由你翻译, 不收中文); subject 必填'
                     '(角色+动作/构图), outfit/scene 可选, count 1~4 默认 2。'
+                    '画大肥鱼(DS娘)时: 要 Q 版二头身就在 subject 里写 "chibi", '
+                    '要女仆原版就写 "maid version", 什么都不写默认 Q 版。'
                     '红线: R18 词与真人声优/偶像名字一律拒单。'
                     '返回 JSON: ok/reason/images(洗净版绝对路径, 可直接发图)/batch_dir。',
      'inputSchema': {'type': 'object', 'properties': {
