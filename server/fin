@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fin —— 鱼鳍系统 CLI（主人 PC 上的读写/执行，2026-11-10）
+
+鱼眼是看，pc_body 是说话，鱼鳍是动手。跑在云上，动的是主人 PC。
+链路：本机 127.0.0.1:47860 → 反向 SSH 隧道 → PC 17860 → pc_fins.py
+
+用法:
+  fin status
+  fin exec "dir D:\\"                # cmd（默认），返回真实退出码
+  fin exec --ps "Get-Process | Select -First 3"
+  fin exec --cwd "D:\\x" --timeout 60 "npm test"
+  fin read "D:\\a.md" [--offset 0] [--max 20000] [--b64]
+  fin write "D:\\a.txt" --from -          # 从 stdin 写（可 --append）
+  fin write "D:\\a.png" --b64-file a.png  # 二进制
+  fin ls "D:\\" [--q 关键词] [--ext docx,xlsx] [--limit 300]
+  fin stat "D:\\a.md"
+  fin audit [-n 20]
+
+约定:
+  * 退出码 = 远端命令的退出码（脚本里可直接 && / ||）
+  * 读文件默认输出正文到 stdout（便于 grep/pipeline），--json 看元数据
+  * 令牌 ~/.dsh/eye-server.token；URL 可用 FIN_URL 覆盖
+  * 写文件不会自动备份；系统目录禁止写，凭据类文件禁止读写
+"""
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BASE = os.environ.get('FIN_URL', 'http://127.0.0.1:47860').rstrip('/')
+TOKEN_FILE = os.environ.get('FIN_TOKEN_FILE', str(Path.home() / '.dsh' / 'eye-server.token'))
+
+
+def _token():
+    try:
+        return Path(TOKEN_FILE).read_text(encoding='utf-8').strip()
+    except Exception as e:
+        sys.exit('fin: 读不到令牌 %s (%s)' % (TOKEN_FILE, e))
+
+
+def call(method, route, params=None, body=None, timeout=320):
+    url = BASE + route
+    if params:
+        params = {k: v for k, v in params.items() if v is not None}
+        if params:
+            url += '?' + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={'Authorization': 'Bearer ' + _token()})
+    if data:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode('utf-8'))
+        except Exception:
+            d = {'error': 'http-%d' % e.code}
+        d.setdefault('error', 'http-%d' % e.code)
+        return d
+    except Exception as e:
+        return {'error': 'link-fail', 'detail': str(e)[:200],
+                'hint': '查 47860 隧道 / PC 桥是否活着（fin status）'}
+
+
+def die(d, code=1):
+    print('fin: %s' % (d.get('reason') or d.get('detail') or d.get('error') or d), file=sys.stderr)
+    if d.get('hint'):
+        print('hint: %s' % d['hint'], file=sys.stderr)
+    sys.exit(code)
+
+
+def cmd_status(a):
+    d = call('GET', '/fins/status')
+    print(json.dumps(d, ensure_ascii=False, indent=2))
+    if not d.get('ok'):
+        sys.exit(1)
+
+
+def cmd_exec(a):
+    d = call('POST', '/fins/exec', body={'cmd': a.cmd, 'cwd': a.cwd,
+                                        'timeout_s': a.timeout, 'shell': a.shell},
+             timeout=(a.timeout or 20) + 30)
+    if d.get('error'):
+        die(d)
+    sys.stdout.write(d.get('stdout') or '')
+    sys.stdout.flush()
+    if d.get('stderr'):
+        sys.stderr.write(d['stderr'])
+    if a.verbose or d.get('timed_out') or d.get('truncated'):
+        print('\n[fin] exit=%s dur=%sms timed_out=%s out=%sB err=%sB%s' % (
+            d.get('exit'), d.get('dur_ms'), d.get('timed_out'),
+            d.get('stdout_bytes'), d.get('stderr_bytes'),
+            ' TRUNCATED' if d.get('truncated') else ''), file=sys.stderr)
+    if d.get('timed_out'):
+        sys.exit(124)
+    sys.exit(int(d.get('exit') or 0))
+
+
+def cmd_read(a):
+    d = call('GET', '/fins/read', params={'path': a.path, 'offset': a.offset,
+                                          'max': a.max, 'b64': 1 if a.b64 else None})
+    if not d.get('ok'):
+        die(d)
+    if a.json:
+        out = {k: v for k, v in d.items() if k not in ('text', 'b64')}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
+    if d.get('kind') == 'base64':
+        sys.stdout.write(d['b64'])
+    else:
+        sys.stdout.write(d['text'])
+        if not d['text'].endswith('\n'):
+            sys.stdout.write('\n')
+        if d.get('truncated'):
+            print('[fin] 还有 %d 字，用 --offset %d 继续' % (
+                d['chars'] - (d['offset'] + d['returned_chars']), d['next_offset']),
+                file=sys.stderr)
+
+
+def cmd_write(a):
+    raw = None
+    if a.b64_file:
+        raw = base64.b64encode(Path(a.b64_file).read_bytes()).decode('ascii')
+        body = {'path': a.path, 'b64': raw, 'append': a.append}
+    else:
+        if a.from_ == '-':
+            content = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+        else:
+            content = Path(a.from_).read_text(encoding='utf-8')
+        body = {'path': a.path, 'content': content, 'append': a.append}
+    d = call('POST', '/fins/write', body=body)
+    if not d.get('ok'):
+        die(d)
+    print('written %s bytes -> %s%s' % (d['bytes'], d['path'],
+                                       ' (created)' if d.get('created') else ''), file=sys.stderr)
+
+
+def cmd_ls(a):
+    d = call('GET', '/fins/list', params={'dir': a.dir, 'q': a.q,
+                                          'ext': a.ext, 'limit': a.limit})
+    if not d.get('ok'):
+        die(d)
+    if a.json:
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+        return
+    if not a.dir and d.get('roots'):
+        print('drives: ' + '  '.join(d['roots']))
+        print('home:   ' + d.get('home', ''))
+        return
+    print('%s  (%d 项%s)' % (d['dir'], d['count'], ', 已截断' if d.get('truncated') else ''))
+    for it in d['items']:
+        if it['type'] == 'dir':
+            print('  <dir>              %s' % it['name'])
+        else:
+            print('  %10d  %s  %s' % (it.get('size') or 0, it.get('mtime', ''), it['name']))
+
+
+def cmd_stat(a):
+    d = call('GET', '/fins/stat', params={'path': a.path})
+    if not d.get('ok'):
+        die(d)
+    print(json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def cmd_audit(a):
+    d = call('GET', '/fins/audit', params={'n': a.n})
+    if not d.get('ok'):
+        die(d)
+    for r in d.get('rows') or []:
+        mark = 'OK ' if r.get('ok') else 'ERR'
+        print('%s %s %-5s %s' % (r.get('ts_local', ''), mark, r.get('action'),
+                                 r.get('detail', '')))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='fin', description='鱼鳍系统：主人 PC 上的读写/执行')
+    sub = ap.add_subparsers(dest='cmd')
+
+    s = sub.add_parser('status', help='桥/开关/限额')
+    s.set_defaults(f=cmd_status)
+
+    s = sub.add_parser('exec', help='跑命令（cmd 或 --ps）')
+    s.add_argument('cmd', help='命令文本，用引号包住')
+    s.add_argument('--ps', dest='shell', action='store_const', const='ps', default='cmd')
+    s.add_argument('--cwd', default=None)
+    s.add_argument('--timeout', type=float, default=20)
+    s.add_argument('-v', '--verbose', action='store_true')
+    s.set_defaults(f=cmd_exec)
+
+    s = sub.add_parser('read', help='读文件（文本/Word/Excel）')
+    s.add_argument('path')
+    s.add_argument('--offset', type=int, default=0)
+    s.add_argument('--max', type=int, default=None)
+    s.add_argument('--b64', action='store_true', help='取原始字节(base64)')
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(f=cmd_read)
+
+    s = sub.add_parser('write', help='写文件')
+    s.add_argument('path')
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument('--from', dest='from_', help='源文件，- 表示 stdin')
+    g.add_argument('--b64-file', help='二进制源文件')
+    s.add_argument('--append', action='store_true')
+    s.set_defaults(f=cmd_write)
+
+    s = sub.add_parser('ls', help='列目录（无参数=盘符）')
+    s.add_argument('dir', nargs='?', default='')
+    s.add_argument('--q', default=None)
+    s.add_argument('--ext', default=None, help='如 docx,xlsx')
+    s.add_argument('--limit', type=int, default=300)
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(f=cmd_ls)
+
+    s = sub.add_parser('stat', help='文件信息')
+    s.add_argument('path')
+    s.set_defaults(f=cmd_stat)
+
+    s = sub.add_parser('audit', help='最近动作台账')
+    s.add_argument('-n', type=int, default=20)
+    s.set_defaults(f=cmd_audit)
+
+    a = ap.parse_args()
+    if not getattr(a, 'f', None):
+        ap.print_help()
+        sys.exit(2)
+    a.f(a)
+
+
+if __name__ == '__main__':
+    main()
