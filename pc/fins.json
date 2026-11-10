@@ -1,0 +1,49 @@
+{
+  "enabled": true,
+  "default_timeout_s": 20,
+  "max_timeout_s": 300,
+  "max_chars": 40000,
+  "max_file_bytes": 8388608,
+  "deny_globs": [
+    "*/.ssh/*",
+    "*/.aws/*",
+    "*/.gnupg/*",
+    "*/id_rsa*",
+    "*/id_ed25519*",
+    "*/id_ecdsa*",
+    "*/id_dsa*",
+    "*.pem",
+    "*.key",
+    "*.pfx",
+    "*.p12",
+    "*.ppk",
+    "*.kdbx",
+    "*.jks",
+    "/d/stardewai/dsh-pet/.eye-token",
+    "*/.eye-token",
+    "*/.git-credentials",
+    "*/.netrc",
+    "*/admin-password",
+    "*/keys_tmp/*"
+  ],
+  "deny_write_prefix": [
+    "c:/windows",
+    "c:/program files",
+    "c:/program files (x86)",
+    "c:/programdata/microsoft",
+    "c:/$recycle.bin",
+    "c:/system volume information"
+  ],
+  "deny_cmd": [
+    "\\bformat(\\.com)?\\s+[a-z]:",
+    "\\bdiskpart\\b",
+    "\\bbcdedit\\b",
+    "\\bvssadmin\\b[^\\n]*\\bdelete\\b",
+    "\\bcipher\\s+/w",
+    "\\b(rd|rmdir|del|erase)\\b[^\\n]*\\s[a-z]:\\s*/?\\s*(/s|/q|\\*)*\\s*$",
+    "\\bremove-item\\b[^\\n]*[a-z]:[\\\\/]?[\"\\']?\\s*(-recurse)?\\s*-force",
+    "\\bmkfs(\\.\\w+)?\\b",
+    "\\bdd\\s+if="
+  ],
+  "_说明": "主人可直接改本文件，下一条命令立即生效（不用重启桥）。enabled=false 或建 fins.off 文件 = 全线停手；deny_globs=永不读写的路径；deny_write_prefix=禁写目录；deny_cmd=灾难命令黑名单。"
+}

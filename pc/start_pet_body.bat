@@ -14,7 +14,9 @@ if %errorlevel%==7 goto :wddone
 start "" "%PYWEXE%" "%PETDIR%\wd_pc_body.py"
 :wddone
 
-rem immediate once-check so the body comes up without waiting 60s
-"%PYWEXE%" "%PETDIR%\wd_pc_body.py" once
-
+rem 1110: removed the extra `once` prewarm that used to run here.
+rem It raced the resident watchdog in the same second at boot; both saw DOWN and
+rem each spawned lib/standalone.js. The loser fails to bind :7340 but does NOT exit
+rem (keeps its electron child) -> a second, dead pet window on screen.
+rem The resident watchdog already runs check_pass() immediately on start.
 endlocal
