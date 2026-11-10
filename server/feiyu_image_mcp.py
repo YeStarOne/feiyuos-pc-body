@@ -373,30 +373,36 @@ def strip_gate(raw_dir, out_dir):
         if ext not in ('.png', '.jpg', '.jpeg', '.webp'):
             continue
         tmp = out_dir / (p.stem + '.washing')
-        try:
-            data = p.read_bytes()
-            if ext == '.png':
-                (tmp).write_bytes(strip_png_bytes(data))
-            elif ext in ('.jpg', '.jpeg'):
-                (tmp).write_bytes(strip_jpeg_bytes(data))
-            else:
-                with Image.open(p) as im:          # webp: PIL 重存(剥容器块)
-                    im.save(tmp, 'WEBP', lossless=True)
-            same, maxdiff = pixels_equal(p, tmp)
-            if not same:
-                tmp.unlink(missing_ok=True)
-                fails.append((p.name, '像素校验失败 maxdiff=%s' % maxdiff))
-                continue
-            if has_text_meta(tmp):
-                tmp.unlink(missing_ok=True)
-                fails.append((p.name, '洗后仍有内嵌文本'))
-                continue
-            final = out_dir / p.name
-            tmp.replace(final)
-            ok += 1
-        except Exception as e:                     # noqa
+        # 瞬时锁重试一次(1110 实锤: 杀毒扫新落盘文件短暂持锁 → 首轮 PermissionError,
+        # 同文件复检即过; 不重试会静默少一张且 ledger 无从追查)
+        reason = None
+        for attempt in (0, 1):
+            reason = None
+            try:
+                data = p.read_bytes()
+                if ext == '.png':
+                    (tmp).write_bytes(strip_png_bytes(data))
+                elif ext in ('.jpg', '.jpeg'):
+                    (tmp).write_bytes(strip_jpeg_bytes(data))
+                else:
+                    with Image.open(p) as im:          # webp: PIL 重存(剥容器块)
+                        im.save(tmp, 'WEBP', lossless=True)
+                same, maxdiff = pixels_equal(p, tmp)
+                if not same:
+                    reason = '像素校验失败 maxdiff=%s' % maxdiff
+                elif has_text_meta(tmp):
+                    reason = '洗后仍有内嵌文本'
+            except Exception as e:                     # noqa
+                reason = str(e)
+            if reason is None:
+                tmp.replace(out_dir / p.name)
+                ok += 1
+                break
             tmp.unlink(missing_ok=True)
-            fails.append((p.name, str(e)))
+            if attempt == 0:
+                time.sleep(0.5)
+        if reason is not None:
+            fails.append((p.name, reason))
     return ok, fails
 
 
@@ -755,7 +761,9 @@ def tool_gen_image(args):
     except NotImplementedError:
         return {'ok': False, 'reason': '真渲染通道 M4 接入; 当前联调请让 os 侧用 --fake 模式'}
     _ledger({'tool': 'gen_image', 'ok': payload.get('ok', False),
-             'batch_dir': str(batch_dir)})
+             'batch_dir': str(batch_dir), 'seeds': seeds,
+             'washed': payload.get('washed'),
+             'washed_fail': payload.get('washed_fail')})
     return payload
 
 
