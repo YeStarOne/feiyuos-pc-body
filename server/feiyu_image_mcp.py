@@ -110,14 +110,14 @@ CHARACTER_PRESETS = {
         # 锚对齐标准像: 少女体型(用户 1110 实锤"体型不像, 应该是少女体型") + 黑白女仆
         # +白色过膝袜+星月纹大鲸尾。该 LoRA 数据集自带"伴鲸"构图, 尾巴必须写成
         # "从她腰后长出来"并配专属负向压背景鲸(见 neg_extra)。
-        'anchors': ('(petite:1.25), (young girl:1.2), (small breasts:1.15), '
-                    '(round face:1.15), '
-                    'whale fin ears, ahoge, (long wavy hair:1.15), dark blue hair, '
-                    'blue gradient hair tips, '
-                    '(her whale tail attached to her lower back:1.3), '
-                    '(starry navy whale tail:1.15), '
-                    'maid dress with white apron, white thighhighs, black bow, '
-                    'big blue eyes, '),
+               'anchors': ('(petite:1.3), (young girl:1.2), (small breasts:1.15), '
+                           '(round face:1.3), (cute:1.15), '
+                           'whale fin ears, ahoge, (long wavy hair:1.15), dark blue hair, '
+                           'blue gradient hair tips, '
+                           '(her whale tail attached to her lower back:1.3), '
+                           '(starry navy whale tail:1.15), '
+                           'maid dress with white apron, white thighhighs, black bow, '
+                           'big blue eyes, '),
         'neg_extra': ('(floating whale:1.3), (whale in background:1.3), '
                       '(giant whale:1.2), (whale beside her:1.25), '
                       '(from behind:1.3), (back view:1.3), (rear view:1.25)'),
