@@ -145,6 +145,9 @@ class T5McpSmoke(unittest.TestCase):
         M.FAKE = True
         # 沙盒: 假图/种子记账全落临时目录, 不污染真实产出盘
         cls._sandbox = tempfile.mkdtemp(prefix='fyimg_test_')
+        # 1110: 单测绝不真往服务器回传(fake 图不该上生产媒体目录); 回传映射单测里用桩验
+        cls._old_publish = M.PUBLISH
+        M.PUBLISH = ''
         cls._old_out, cls._old_seed = M.OUT_BASE, M.SEED_USED_FILE
         M.OUT_BASE = Path(cls._sandbox) / 'out'
         M.SEED_USED_FILE = Path(cls._sandbox) / 'seed_used.json'
@@ -158,7 +161,34 @@ class T5McpSmoke(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
         M.OUT_BASE, M.SEED_USED_FILE = cls._old_out, cls._old_seed
+        M.PUBLISH = cls._old_publish
         shutil.rmtree(cls._sandbox, ignore_errors=True)
+
+    def test_publish_rewrites_to_remote_paths(self):
+        """回传契约: images 换成服务器 jpg 路径, PC 原图留在 images_pc; 失败不静默。"""
+        import types
+        calls = []
+
+        class R:
+            returncode = 0
+            stderr = b''
+        old_sub, old_pub = M.subprocess, M.PUBLISH
+        M.subprocess = types.SimpleNamespace(run=lambda *a, **k: (calls.append(a), R())[1])
+        M.PUBLISH = 'agent@example.test:/tmp/media/gen_image'
+        try:
+            from PIL import Image
+            d = Path(self._sandbox) / 'pub'
+            d.mkdir(exist_ok=True)
+            p = d / 'a.png'
+            Image.new('RGB', (8, 8), (1, 2, 3)).save(p, 'PNG')
+            payload = {'images': [str(p)]}
+            M._publish_payload(payload)
+            self.assertTrue(payload['publish']['ok'], payload['publish'])
+            self.assertEqual(payload['images'], ['/tmp/media/gen_image/pub/a.jpg'])
+            self.assertEqual(payload['images_pc'], [str(p)])
+            self.assertTrue(any('mkdir' in str(c) for c in calls))
+        finally:
+            M.subprocess, M.PUBLISH = old_sub, old_pub
 
     def call(self, body, session=True):
         hdr = {'Content-Type': 'application/json',
@@ -246,6 +276,50 @@ class T6BuildApi(unittest.TestCase):
         self.assertIn('176', api)
         # 负向 nsfw 保险必须在(非 R18 第一道)
         self.assertIn('nsfw', api['153']['inputs']['text'])
+
+    def test_detailer_detectors_not_crossed(self):
+        """1111 修: 模板把两个细节器的检测器接反了(手部专用词压到脸上)。"""
+        if not M.TEMPLATE_PNG.exists():
+            self.skipTest('模板 PNG 不在本机(其他机器跳过)')
+        api = M.build_api('POS', M.NEG_FIXED, 109002, 'detbatch')
+        # 176(先跑 dn0.5, 走主正向) = 脸 → face_yolov8m
+        self.assertEqual(api['176']['inputs']['bbox_detector'], ['143', 0])
+        self.assertEqual(api['143']['inputs']['model_name'], 'bbox/face_yolov8m.pt')
+        # 142(后跑, 走手部专用提词 301/302) = 手 → hand_yolov8s
+        self.assertEqual(api['142']['inputs']['bbox_detector'], ['177', 0])
+        self.assertEqual(api['177']['inputs']['model_name'], 'bbox/hand_yolov8s.pt')
+
+    def test_signature_weighting_and_wlop_down(self):
+        """1111 鱼鱼报障: 顶部签名 'DI N WLOP' / 手上铁环 → 名称类提权 + wlop 1→0.7。"""
+        self.assertIn('(artist:wlop:0.7)', M.ART)
+        self.assertNotIn('(artist:wlop:1)', M.ART)
+        for t in ('(signature:1.5)', '(watermark:1.5)', '(artist name:1.4)',
+                  '(ring on hand:1.25)', '(metal bracelet:1.2)'):
+            self.assertIn(t, M.NEG_FIXED)
+        # 画风骨架其余 11 个 tag 不许动
+        for t in ('(artist:tianliang duohe fangdongye:0.9)', 'artist:ciloranko',
+                  'artist:noyu', 'ningen mame', 'artist:dino', '(artist:fkey:0.8)'):
+            self.assertIn(t, M.ART)
+
+    def test_restraint_negatives_and_r18_lora_off(self):
+        """1111 第二轮: 签名消了但手铐/脚镣变多 → 点名束缚具 + 尾位 R18 细节 LoRA 归零。"""
+        for t in ('(shackles:1.35)', '(handcuffs:1.35)', '(leg irons:1.35)',
+                  '(ankle cuffs:1.35)', '(leash:1.3)', '(chains:1.3)'):
+            self.assertIn(t, M.NEG_FIXED)
+        # 泛词 collar 会打掉正向的 pj shirt with a white lace collar, 不许进负向
+        self.assertNotIn('(collar:', M.NEG_FIXED)
+        self.assertEqual(M.DETAIL_LORA_STRENGTH, 0.0)
+        if not M.TEMPLATE_PNG.exists():
+            self.skipTest('模板 PNG 不在本机(其他机器跳过)')
+        api = M.build_api('POS', M.NEG_FIXED, 109003, 'loraoffbatch')
+        node = api[M.DETAIL_LORA_NODE]['inputs']
+        self.assertEqual(node['strength_model'], 0.0)
+        self.assertEqual(node['strength_clip'], 0.0)
+        # 其余 LoRA 链强度不许被顺手改掉
+        self.assertEqual(api['175']['inputs']['strength_model'], 1.0)
+        self.assertEqual(api['188']['inputs']['strength_model'], -2.0)
+        self.assertEqual(api['189']['inputs']['strength_model'], 1.0)
+        self.assertEqual(api['193']['inputs']['strength_model'], -1.0)
 
 
 class T7FishPreset(unittest.TestCase):

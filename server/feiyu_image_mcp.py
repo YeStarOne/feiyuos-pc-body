@@ -30,9 +30,11 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -50,6 +52,15 @@ COMFY_DIR = Path(r'G:\ComfyUI')
 COMFY_URL = 'http://127.0.0.1:8188'
 SEED_BASE = 109000            # 台账顺延新段
 SEED_USED_FILE = HERE / 'seed_used.json'
+
+# ── 图回传(1110 夜; 她那边只读得到服务器本地文件, PC 的 G:\ 路径她读不到) ──
+#   出图后: PNG → JPEG(q95, 4:4:4, 与 G:\生图工作盘\洗图工具 同档) → scp 到服务器媒体目录。
+#   目标目录必须落在 dsh-onebot-qq 的 mediaDir(~/.dsh/media/onebot) 之内, 否则发送栅栏拒收。
+#   置空 FEIYU_IMAGE_PUBLISH='' 可关掉回传(退回只给 PC 路径的旧行为)。
+PUBLISH = os.environ.get('FEIYU_IMAGE_PUBLISH',
+                         'agent@60.204.236.128:/home/agent/.dsh/media/onebot/gen_image')
+SSH_BIN = os.environ.get('FEIYU_IMAGE_SSH', r'D:\Program Files\Git\usr\bin\ssh.exe')
+SCP_BIN = os.environ.get('FEIYU_IMAGE_SCP', r'D:\Program Files\Git\usr\bin\scp.exe')
 
 # ── 直播互锁(M3, feiyu-os 1110 拍板): 进程名含「哔哩哔哩」或 livehime 即推流中, ──
 # 宁保守(开着就算); **不要**用 live_host /healthz 的 obs.streaming 当判据
@@ -76,6 +87,11 @@ _LAST_GEN_TS = [0.0]                             # [可变] 上次成功出单�
 # 重连 LoRA 必须"原位换"或显式点名, 否则 FaceDetailer 拿旧模型会把脸换成另一个人)。
 # 触发词/权重/外观锚出处: 《Ds娘的日常》复刻档案(ref01 全对版), 权重 0.9 沿用已验证配方。
 TAIL_LORA_NODE = '900'
+# 1111 第二轮: 模板尾位(193 之后)那条细节 LoRA(`realistic_cum_v1`)是 R18 配饰/体液的
+# 强先验。非 R18 线本来就不该挂它 —— 强度归零(等于摘掉, 但保留节点不动接线),
+# 需要恢复旧观感时把 DETAIL_LORA_STRENGTH 调回 0.8。
+DETAIL_LORA_NODE = '192'
+DETAIL_LORA_STRENGTH = 0.0
 # 大肥鱼(DS娘)两套预设**分开接线分开画**(用户 1110 拍板: "女仆和q版应该分开",
 # 二次纠正: "Q版要专门用Q版lora生成, 女仆是有星星尾巴的那个"):
 #   fish_q    = Q版二头身本体 —— Q版大肥鱼ds_whalemaid(触发 ds_whalemaid, 47 张数据集)
@@ -97,6 +113,21 @@ CHARACTER_PRESETS = {
                     'maid dress, (whale print apron:1.15), blue bow, '
                     'blue bows in hair, big blue eyes, white frilled ankle socks, '
                     'mary janes, '),
+        # 1111: 数据集自带"伴生Q版小人"构图 → 单人物声明 + 压第二个人
+        'single': ('(exactly one girl in the frame:1.35), (solo:1.2), '),
+        'neg_extra': ('(two girls:1.45), (second girl:1.45), (another girl:1.4), '
+                      '(small chibi girl in the background:1.5), (tiny girl:1.45), '
+                      '(miniature figure:1.45), (plushie:1.4), (stuffed toy:1.35), '
+                      '(mascot character:1.4), (multiple heads:1.45), (split face:1.4), '
+                      '(floating whale:1.35), (whale in background:1.35), '
+                      # 1111: 109032 把鲸画成"头顶顶着一只大鲸" —— 数据集伴生鲸的另一种形态
+                      '(whale above her head:1.5), (whale hat:1.45), (whale on her head:1.45), '
+                      '(giant whale:1.35), (whale beside her:1.4), '
+                      # 1111: 109037 左下角还蹲着个极小的米色小人 —— 伴生人的最小形态
+                      '(tiny figure in the corner:1.5), (small figure on the floor:1.45), '
+                      '(doll on the floor:1.45)'),
+        'pos_suffix': ('(facing the viewer:1.3), (looking at the viewer:1.25), '
+                       '(front view:1.2)'),
     },
     'fish_maid': {
         'match': ('女仆', 'maid version', 'maid ver'),
@@ -120,9 +151,13 @@ CHARACTER_PRESETS = {
                            'big blue eyes, '),
         'neg_extra': ('(floating whale:1.3), (whale in background:1.3), '
                       '(giant whale:1.2), (whale beside her:1.25), '
-                      '(from behind:1.3), (back view:1.3), (rear view:1.25)'),
-        # 复刻标准像的构图控制: 视角词压句尾(规则15, 句尾权重最大)。
-        # probe4 实锤: subject 里写 facing the viewer 会被背面构图稀释, 必须压句尾。
+                      '(two girls:1.45), (second girl:1.45), (another girl:1.4), '
+                      '(small chibi girl in the background:1.45), (tiny girl:1.4), '
+                      '(multiple heads:1.45), (two heads:1.4)'),
+        'single': ('(exactly one girl in the frame:1.3), '),
+        # 1111 修正: 原来全批硬压 from behind/back view/rear view, 但对"回望"这种体裁
+        # 是过度抑制 —— 女仆 LoRA 自带转身先验, 压死背面后模型只能画成"侧后回望半转身"
+        # (109028/109029 两张全中)。背面机位交给 subject 明确写, 这里只留"别背着观众"。
         'pos_suffix': ('(facing the viewer:1.3), (looking at the viewer:1.25), '
                        '(front view:1.2)'),
     },
@@ -149,7 +184,10 @@ HEAD = '(solo:1.25), 1girl, '
 ART = ('(artist:tianliang duohe fangdongye:0.9), artist:ciloranko, artist:noyu, '
        'noyu23386566,ningen mame, (artist:sho:0.8264462809917354), '
        '(sho lwlw:0.9090909090909091),(artist:kedama_milk:0.5),(bee_\\(deadflow\\):0.7),'
-       'artist:dino,(artist:fkey:0.8),(artist:wlop:1),year 2023,')
+       'artist:dino,(artist:fkey:0.8),(artist:wlop:0.7),year 2023,')
+# 1111 鱼鱼报障(顶部 "DI N WLOP" 签名 / 手上铁环): 这两样是 ART 里 wlop·dino 的
+# 强相关先验(Danbooru 里 artist tag ≈ 图上有署名), 无权重负向打不过。wlop 1→0.7 是
+# 收窄后的第一刀(仍压不住才考虑摘), 画风骨架其余 11 个 tag 一字未动。
 
 # 1109 定案串: BASE_NEG(剥 censored 段) + TAIL_NEG。⚠ 与做爱批的差别就在
 # `nsfw, suggestive` **保留** —— 这是非 R18 的第一道保险(美图批 66/66 验证过)。
@@ -169,7 +207,18 @@ NEG_TAIL = ('nsfw, suggestive, multiple girls, 2girls, 3girls, crowd, extra char
 # 1110 用户"不喜欢黑丝" —— 模块级沿用(压腿部紧身单品)
 NEG_TIGHTS = ('(black tights:1.35), (pantyhose:1.3), (black leggings:1.3), (fishnet:1.3), '
               '(thigh straps:1.2)')
-NEG_FIXED = NEG_BASE + NEG_TAIL + NEG_TIGHTS
+# 1111 署名/配饰提权(与上面 wlop 0.7 配套): 名称类无权重时被 artist 串压住, 提权才见效;
+# 铁环/手链单独点名 —— 只在手上出现的是配饰, 不是构图问题, 别去改构图词。
+NEG_SIGN = ('(signature:1.5), (watermark:1.5), (artist name:1.4), (logo:1.4), (text:1.4), '
+            '(english text:1.3), (signature on hand:1.35), (ring on hand:1.25), '
+            '(metal bracelet:1.2), (ornate hand accessories:1.15), ')
+# 1111 第二轮(签名已消, 手铐/脚镣反增): 提权把"金属配饰"这一类挤到别处了 —— 但只要画面里
+# 出现了束缚具, 就说明这个方向还没封死。点名到具体物件, 不写泛词(写 collar 会打掉
+# 正向的 pj shirt with a white lace collar)。
+NEG_RESTRAIN = ('(shackles:1.35), (handcuffs:1.35), (leg irons:1.35), (ankle cuffs:1.35), '
+                '(chains:1.3), (leash:1.3), (restraints:1.25), (bindings:1.25), '
+                '(ball and chain:1.3), ')
+NEG_FIXED = NEG_BASE + NEG_SIGN + NEG_RESTRAIN + NEG_TAIL + NEG_TIGHTS
 
 # ── 拒单闸 ────────────────────────────────────────────────
 # R18 词黑名单(命中即拒)。英文按词边界, 中文按整词(不写裸"裸"字——会误杀"裸足")。
@@ -251,12 +300,24 @@ def compose(subject, outfit='', scene='', preset_key=None):
     _key, preset = match_preset(subject + ' ' + outfit)
     if preset_key and preset_key in CHARACTER_PRESETS:
         _key, preset = preset_key, CHARACTER_PRESETS[preset_key]
+    # 1111 bugfix: 该 LoRA 数据集全是"本体+伴生Q版小人"双人构图(数据源下载图里的
+    # 画中画), 所以 LoRA 一直在召唤第二个女仆 —— 成年版出双头克隆, Q版出背景幽灵小人。
+    # NEG_TAIL 已有 2girls/extras, 但打不过 LoRA 的构图先验(5/5 全中), 必须给足权重。
     char_block = ('' + preset['trigger'] + ', ' + preset['anchors']) if preset else ''
+    if preset and preset.get('single'):
+        char_block += preset['single']
     core = (HEAD + ART + char_block
             + (outfit + ' ' if outfit else '') + subject).strip()
     core = re.sub(r'\s*,\s*', ', ', core).rstrip(', ')
     if len(core) > LIMIT:
-        return None, None, '描述过长(%d 字, 上限 %d): 请精简 subject' % (len(core), LIMIT), None
+        # 1111: 预设自带的加成块(character anchors / single)不是用户输入, 顶破闸时先还原
+        # 成"字符锚 + 用户 body"再判 —— 用户该精简的是他自己写的那部分。全身拍 M2 正式批
+        # 是 758 字, 这一段就该让闸放行而不是拒单。
+        body = (outfit + ' ' if outfit else '') + subject
+        bare = re.sub(r'\s*,\s*', ', ', (HEAD + ART + body)).strip().rstrip(', ')
+        if len(bare) > LIMIT:
+            return None, None, ('描述过长(%d 字, 上限 %d): 请精简 subject'
+                                % (len(bare), LIMIT)), None
     pos = (core + (', ' + scene if scene else '')).rstrip(', ')
     if len(pos) > LIMIT:
         pos = core                                   # 降级: 整段场景删掉
@@ -567,8 +628,14 @@ def build_api(pos, neg, seed, batch_name, preset=None):
     from PIL import Image
     with Image.open(TEMPLATE_PNG) as im:
         api = json.loads(im.text['prompt'])
-    api['165']['inputs']['text'] = (pos + preset['pos_suffix']) if preset and preset.get('pos_suffix') else pos
-    neg_use = neg + preset['neg_extra'] if preset and preset.get('neg_extra') else neg
+    # 1111 bugfix: 旧写法 `pos + pos_suffix` 没有分隔符 → 拼出
+    # `white background(facing the viewer:1.3)`, 整串构图词被 CLIP 当成乱码, 机位全部失效。
+    _suf = preset.get('pos_suffix') if preset else None
+    api['165']['inputs']['text'] = (pos + ', ' + _suf) if _suf else pos
+    # 1111 bugfix: neg_extra 是 tuple, 旧写法 neg + tuple 直接 TypeError(只在 preset 带
+    # neg_extra 时才炸 —— fish_maid 全批 500 就是死在这行, 5 张一张没出)。
+    _nx = preset.get('neg_extra') if preset else None
+    neg_use = (neg + ', ' + ', '.join(_nx)) if _nx else neg
     api['153']['inputs']['text'] = neg_use
     api['17']['inputs']['denoise'] = (preset.get('dn17') or 0.55) if preset else 0.55
     if preset:
@@ -587,6 +654,15 @@ def build_api(pos, neg, seed, batch_name, preset=None):
     api['142']['inputs']['negative'] = ['302', 0]
     api['142']['inputs']['denoise'] = 0.55
     api['142']['inputs']['cycle'] = 1
+    # 1111 修接线: 生产模板把两个细节器的检测器接反了 —— 176(先跑, dn0.5) 接的是
+    # 手部检测器、142(拿手部专用提词 301/302) 接的是人脸检测器。结果手部专用负向
+    # (fused fingers / toes / feet instead of hands)全落在脸的裁片上, 手一次也没拿到。
+    # 176=脸(face_yolov8m/143), 142=手(hand_yolov8s/177)。
+    api['176']['inputs']['bbox_detector'] = ['143', 0]
+    api['142']['inputs']['bbox_detector'] = ['177', 0]
+    # 1111 第二轮: 尾位 R18 细节 LoRA 归零(非 R18 线不挂它; 恢复旧观感 = 改回 0.8)
+    api[DETAIL_LORA_NODE]['inputs']['strength_model'] = DETAIL_LORA_STRENGTH
+    api[DETAIL_LORA_NODE]['inputs']['strength_clip'] = DETAIL_LORA_STRENGTH
     api['77']['inputs']['images'] = ['142', 0]
     api['77']['inputs']['filename_prefix'] = '肥鱼OS/%s/fyi_%d' % (batch_name, seed)
     for n in SEED_NODES:
@@ -674,6 +750,62 @@ def _slug(s, n=14):
     return s or 'img'
 
 
+def _to_jpg(png, quality=95):
+    """PNG → JPEG(q95 / 4:4:4 / optimize), 与 G:\\生图工作盘\\洗图工具 同档, 体积约 1/3~1/5。"""
+    from PIL import Image
+    dst = Path(png).with_suffix('.jpg')
+    with Image.open(png) as im:
+        im.convert('RGB').save(dst, 'JPEG', quality=quality, subsampling=0, optimize=True)
+    return dst
+
+
+def _publish_payload(payload):
+    """把洗净图转 JPEG 并推到服务器媒体目录, 让**她那边**读得到(qq_send_image 只认服务器本地路径)。
+
+    成功: payload['images'] = 服务器侧路径(可直接发给 QQ), 原 PC 路径留 images_pc。
+    失败: 保留原路径 + publish.ok=False + 错误原因 —— 绝不静默假装成功。
+    """
+    images = payload.get('images') or []
+    if not images:
+        payload['publish'] = {'ok': False, 'err': 'no images'}
+        return payload
+    target, _, remote_root = (PUBLISH or '').partition(':')
+    if not (target and remote_root.startswith('/')):
+        payload['publish'] = {'ok': False, 'skipped': True,
+                              'err': "FEIYU_IMAGE_PUBLISH 未配置(或置空), 只返回 PC 路径"}
+        return payload
+    batch = Path(images[0]).parent.name
+    remote_dir = remote_root.rstrip('/') + '/' + batch
+    try:
+        up_dir = Path(images[0]).parent / 'upload'
+        up_dir.mkdir(exist_ok=True)
+        jpgs = []
+        for p in images:
+            jpg = _to_jpg(p)
+            dst = up_dir / jpg.name
+            shutil.move(str(jpg), str(dst))
+            jpgs.append(dst)
+        opt = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=8']
+        r = subprocess.run([SSH_BIN, '-n'] + opt + [target, 'mkdir -p ' + shlex.quote(remote_dir)],
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError('ssh mkdir rc=%d %s' % (r.returncode, r.stderr.decode('utf-8', 'ignore')[:150]))
+        for f in jpgs:
+            r = subprocess.run([SCP_BIN, '-q'] + opt + [str(f), '%s:%s/' % (target, remote_dir)],
+                               capture_output=True, timeout=90)
+            if r.returncode != 0:
+                raise RuntimeError('scp %s rc=%d %s' % (f.name, r.returncode,
+                                                        r.stderr.decode('utf-8', 'ignore')[:150]))
+        payload['images_pc'] = list(images)
+        payload['images'] = [remote_dir + '/' + f.name for f in jpgs]
+        payload['publish'] = {'ok': True, 'dir': remote_dir, 'n': len(jpgs),
+                              'bytes': int(sum(f.stat().st_size for f in jpgs)),
+                              'note': 'jpg 上传版; 原 PNG 在 PC images_pc'}
+    except Exception as e:                                  # noqa: BLE001
+        payload['publish'] = {'ok': False, 'err': str(e)[:220]}
+    return payload
+
+
 # ══ MCP 工具面 ═════════════════════════════════════════════
 LEDGER = HERE / 'ledger.jsonl'
 LOG = HERE / 'logs'
@@ -736,6 +868,7 @@ def tool_gen_image(args):
                   if p.suffix.lower() == '.png']
         payload = {'ok': n_ok > 0, 'fake': True, 'images': images, 'batch_dir': str(batch_dir),
                    'pos_len': len(pos), 'washed': n_ok, 'washed_fail': [f[0] for f in fails]}
+        _publish_payload(payload)                  # 联调也走一遍回传, 不烧显卡就能验链路
         _ledger({'tool': 'gen_image', 'ok': payload['ok'], 'fake': True,
                  'batch_dir': str(batch_dir), 'washed': n_ok})
         return payload
@@ -760,10 +893,12 @@ def tool_gen_image(args):
             payload['note'] = '队列仍有 %d 个任务, 本次不卸载模型' % q
     except NotImplementedError:
         return {'ok': False, 'reason': '真渲染通道 M4 接入; 当前联调请让 os 侧用 --fake 模式'}
+    _publish_payload(payload)                      # 出完即回传(jpg)到服务器, 她那边才发得出去
     _ledger({'tool': 'gen_image', 'ok': payload.get('ok', False),
              'batch_dir': str(batch_dir), 'seeds': seeds,
              'washed': payload.get('washed'),
-             'washed_fail': payload.get('washed_fail')})
+             'washed_fail': payload.get('washed_fail'),
+             'publish': payload.get('publish')})
     return payload
 
 
@@ -851,6 +986,10 @@ class McpHandler(BaseHTTPRequestHandler):
         if method == 'initialize':
             sid = uuid.uuid4().hex
             SESSIONS[sid] = True
+            # 1111: os 侧每次 callTool 都重新 initialize(每单一个新 session), 这个 dict 不设上限
+            # 就是无界增长。session 不参与鉴权(仅作握手凭据), 保留最近 4096 个足够。
+            while len(SESSIONS) > 4096:
+                SESSIONS.pop(next(iter(SESSIONS)), None)
             result = {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}},
                       'serverInfo': {'name': 'feiyu-image-mcp', 'version': '0.2.0'}}
         elif method == 'notifications/initialized':
