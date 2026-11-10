@@ -259,10 +259,18 @@ class T7FishPreset(unittest.TestCase):
             self.assertEqual(p['trigger'], 'ds_whalemaid')
 
     def test_match_maid_keywords(self):
-        for s in ('大肥鱼女仆版', '女仆 fish girl', 'maid version standing'):
+        for s in ('大肥鱼女仆版', '女仆 fish girl', 'maid version whale maid',
+                  '女仆版的你 whale maid'):
             key, p = M.match_preset(s)
             self.assertEqual(key, 'fish_maid', s)
             self.assertEqual(p['trigger'], 'deepseekchan')
+
+    def test_no_cross_character_misroute(self):
+        # 别人的请求带版本词也不准路由到鱼 LoRA(身份词必须在场)
+        for s in ('女仆装的铃兰', 'chibi 可莉', 'maid version standing',
+                  'maid dress girl in garden', '二头身的纳西妲'):
+            key, _p = M.match_preset(s)
+            self.assertIsNone(key, s)
 
     def test_no_match_keeps_tail(self):
         self.assertIsNone(M.match_preset('white dress girl in garden')[0])
@@ -287,7 +295,7 @@ class T7FishPreset(unittest.TestCase):
         self.assertEqual(api['3']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
         self.assertEqual(api['176']['inputs']['model'], [M.TAIL_LORA_NODE, 0])
         # 女仆版换的是另一个文件(DeepseekChan 星星尾巴女仆; ds_whalemaid 是 Q版拷贝别用)
-        _k2, p2 = M.match_preset('女仆版')
+        _k2, p2 = M.match_preset('女仆版 大肥鱼')
         api2 = M.build_api('POS', M.NEG_FIXED, 109011, 'maidbatch', preset=p2)
         self.assertEqual(api2[M.TAIL_LORA_NODE]['inputs']['lora_name'],
                          '女仆大肥鱼DeepseekChan_illust.safetensors')

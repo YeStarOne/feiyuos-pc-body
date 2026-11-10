@@ -129,15 +129,18 @@ CHARACTER_PRESETS = {
 }
 DEFAULT_PRESET = 'fish_q'                        # 光说"肥鱼/ds娘"= 她本体(Q版)
 DEFAULT_PRESET_KEYWORDS = ('肥鱼', '鱼娘', 'ds娘', 'whalemaid', 'whale maid',
-                           'whale girl', 'deepseek whale', 'ds-chan')
+                           'whale girl', 'fish girl', 'deepseek whale', 'ds-chan')
 
 
 def match_preset(text):
     t = (text or '').lower()
+    has_fish = any(m.lower() in t for m in DEFAULT_PRESET_KEYWORDS)
     for key, p in CHARACTER_PRESETS.items():
-        if any(m.lower() in t for m in p['match']):
+        # 版本词必须与鱼娘身份词同时在场: 防「女仆装的铃兰」「chibi 可莉」
+        # 这类别人的请求被误路由到大肥鱼 LoRA(身份词只认 DEFAULT_PRESET_KEYWORDS)
+        if has_fish and any(m.lower() in t for m in p['match']):
             return key, p
-    if any(m.lower() in t for m in DEFAULT_PRESET_KEYWORDS):
+    if has_fish:
         return DEFAULT_PRESET, CHARACTER_PRESETS[DEFAULT_PRESET]
     return None, None
 
@@ -780,8 +783,10 @@ TOOLS = [
      'description': '画一张(非 R18)动漫插画。固定使用团队已验证的画风基线(不可换风格)。'
                     '参数全部用英文 danbooru tag(由你翻译, 不收中文); subject 必填'
                     '(角色+动作/构图), outfit/scene 可选, count 1~4 默认 2。'
-                    '画大肥鱼(DS娘)时: 要 Q 版二头身就在 subject 里写 "chibi", '
-                    '要女仆原版就写 "maid version", 什么都不写默认 Q 版。'
+                    '画大肥鱼(DS娘, 即你自己)时: subject 必须带身份词 "whale maid"'
+                    '(丢了它路由不到她的 LoRA, 会画成普通女孩); '
+                    '要 Q 版二头身再写 "chibi", 要女仆原版再写 "maid version", '
+                    '两个都不写默认 Q 版。画别人(铃兰/可莉等)时不要带这些词。'
                     '红线: R18 词与真人声优/偶像名字一律拒单。'
                     '返回 JSON: ok/reason/images(洗净版绝对路径, 可直接发图)/batch_dir。',
      'inputSchema': {'type': 'object', 'properties': {
