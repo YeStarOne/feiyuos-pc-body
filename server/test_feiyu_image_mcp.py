@@ -190,6 +190,30 @@ class T5McpSmoke(unittest.TestCase):
         finally:
             M.subprocess, M.PUBLISH = old_sub, old_pub
 
+    def test_fake_gen_moss_engine(self):
+        """engine=moss 在 FAKE 模式走通全链(占位图 fym_ 前缀 + 洗图 + engine 标记)。"""
+        M._LAST_GEN_TS[0] = 0.0
+        r = self.call({'jsonrpc': '2.0', 'id': 6, 'method': 'tools/call', 'params': {
+            'name': 'gen_image', 'arguments': {
+                'subject': 'coffee shop storefront poster, the sign reads "MOSS COFFEE"',
+                'engine': 'moss', 'count': 1}}})
+        p = json.loads(r['result']['content'][0]['text'])
+        self.assertTrue(p['ok'], p)
+        self.assertEqual(p.get('engine'), 'moss')
+        self.assertEqual(len(p['images']), 1)
+        for path in p['images']:
+            self.assertIn('fym_', Path(path).name)
+            self.assertFalse(M.has_text_meta(Path(path)))
+
+    def test_bad_engine_rejected(self):
+        M._LAST_GEN_TS[0] = 0.0
+        r = self.call({'jsonrpc': '2.0', 'id': 7, 'method': 'tools/call', 'params': {
+            'name': 'gen_image', 'arguments': {'subject': 'white dress girl',
+                                               'engine': 'flux'}}})
+        p = json.loads(r['result']['content'][0]['text'])
+        self.assertFalse(p['ok'])
+        self.assertIn('engine', p['reason'])
+
     def call(self, body, session=True):
         hdr = {'Content-Type': 'application/json',
                'Accept': 'application/json, text/event-stream'}
@@ -376,6 +400,144 @@ class T7FishPreset(unittest.TestCase):
         # 不换时保持模板原样(rossi)
         api3 = M.build_api('POS', M.NEG_FIXED, 109012, 'plainbatch')
         self.assertIn('rossi', api3[M.TAIL_LORA_NODE]['inputs']['lora_name'])
+
+
+class T8MossEngine(unittest.TestCase):
+    """MOSS 引擎(1113): 权重剥离 / 扁平 sampling_mode 键 / 手部警示 / 官方负面平词。"""
+
+    def test_compose_strips_sdxl_weights(self):
+        pos, _note, err = M.moss_compose('(white dress:1.3), ((long hair:1.2))',
+                                         'red shoes', 'night garden')
+        self.assertIsNone(err)
+        self.assertNotIn(':1.3', pos)
+        self.assertNotIn(':1.2', pos)
+        self.assertIn('white dress', pos)
+        self.assertIn('long hair', pos)
+        self.assertIn('red shoes', pos)
+        self.assertIn('night garden', pos)
+        # 中文/引号逐字保留(MOSS 双语, 引号内文字会被逐字画进图)
+        pos2, _n2, err2 = M.moss_compose('sign reads "肥鱼咖啡"', '', '')
+        self.assertIsNone(err2)
+        self.assertIn('肥鱼咖啡', pos2)
+
+    def test_compose_hand_closeup_note(self):
+        _pos, note, _err = M.moss_compose('close-up of her hand holding a teacup', '', '')
+        self.assertIsNotNone(note)
+        self.assertIn('sdxl', note)
+        _p2, note2, _e2 = M.moss_compose('a coffee shop at night, sign reading "OPEN"', '', '')
+        self.assertIsNone(note2)
+
+    def test_compose_over_limit(self):
+        _p, _n, err = M.moss_compose(('word ' * 500).strip(), '', '')
+        self.assertIn('描述过长', err)
+
+    def test_build_api_flat_sampling_keys(self):
+        """TextGenerate 必须**平铺** sampling_mode.* 键(嵌套能过校验但执行报错, 1110 实锤)。"""
+        api = M.build_moss_api('POS', M.MOSS_NEG, 109100, 'feiyuOS_moss/b1/fym_109100',
+                               enhance=True)
+        self.assertEqual(api['4']['inputs']['text'], ['10', 0])      # 正向来自扩写器
+        self.assertEqual(api['10']['class_type'], 'TextGenerate')
+        tg = api['10']['inputs']
+        self.assertEqual(tg['sampling_mode'], 'on')
+        for k in ('sampling_mode.temperature', 'sampling_mode.top_k',
+                  'sampling_mode.top_p', 'sampling_mode.min_p',
+                  'sampling_mode.repetition_penalty', 'sampling_mode.seed'):
+            self.assertIn(k, tg, k)
+        self.assertEqual(tg['sampling_mode.seed'], 109100)
+        self.assertEqual(tg['max_length'], 1024)
+        self.assertEqual(api['7']['inputs']['positive'], ['4', 0])
+        self.assertEqual(api['7']['inputs']['cfg'], 2.5)
+        self.assertEqual(api['7']['inputs']['sampler_name'], 'er_sde')
+        self.assertEqual(api['2']['inputs']['type'], 'moss_image')   # CLIPLoader type 铁律
+        self.assertEqual(api['9']['inputs']['filename_prefix'],
+                         'feiyuOS_moss/b1/fym_109100')
+        # enhance=False: 直连原文, 无 TextGenerate 节点
+        api2 = M.build_moss_api('POS RAW', M.MOSS_NEG, 109101, 'p', enhance=False)
+        self.assertEqual(api2['4']['inputs']['text'], 'POS RAW')
+        self.assertNotIn('10', api2)
+        self.assertEqual(api['5']['inputs']['text'], M.MOSS_NEG)
+
+    def test_build_api_default_no_enhancer(self):
+        """契约 §五.3: TextGenerate 本契约不用 → 默认直连, 显式 enhance=true 才开。"""
+        api = M.build_moss_api('POS', M.MOSS_NEG, 1, 'p')
+        self.assertEqual(api['4']['inputs']['text'], 'POS')
+        self.assertNotIn('10', api)
+
+    def test_compose_quoted_text_over_150_rejected(self):
+        long_cn = '一二三四五六七八九十' * 16          # 160 字 → 拒
+        _p, _n, err = M.moss_compose('poster with text "%s"' % long_cn, '', '')
+        self.assertIn('拆块', err)
+        short_cn = '一二三四五六七八九十' * 14          # 140 字 → 放行
+        p, _n, e = M.moss_compose('poster with text "%s"' % short_cn, '', '')
+        self.assertIsNone(e)
+
+    def test_moss_neg_is_official_plain_words(self):
+        self.assertIn('nsfw', M.MOSS_NEG)
+        self.assertIn('multiple girls', M.MOSS_NEG)   # 契约 §四.5 业务负向平词追加
+        self.assertNotIn(':1.', M.MOSS_NEG)           # MOSS 加权语法无效, 必须平词
+
+    def test_free_tolerates_empty_body(self):
+        """owner 验收反馈 A: ComfyUI /free 回 **200 + 空 body** → json.loads('') 必炸,
+        动作其实生效了却记 ok:false(ledger 里那条 moss_free 假失败)。空体按 {} 处理。"""
+        class R:
+            def read(self):
+                return b''
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        old_url, old_led = urllib.request.urlopen, M.LEDGER
+        tmp = tempfile.mkdtemp(prefix='fyimg_ledger_')
+        led = Path(tmp) / 'ledger_empty.jsonl'
+        M.LEDGER = led
+        urllib.request.urlopen = lambda req, timeout=None: R()
+        try:
+            self.assertEqual(M._post('/free', {}, base='http://127.0.0.1:9'), {})
+            self.assertTrue(M.moss_free())
+        finally:
+            urllib.request.urlopen, M.LEDGER = old_url, old_led
+        recs = [json.loads(l) for l in led.read_text(encoding='utf-8').splitlines() if l.strip()]
+        self.assertTrue(recs and recs[-1]['ok'] is True, recs)   # 不再是假失败
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_vram_gate_frees_idle_moss_residue(self):
+        """owner 验收反馈 B: 8190 跑完图模型常驻 ~12.3G(**queue=0 也占着**) → 同一实例的
+        第二单被自己的驻留显存误判成"宿主在跑大型游戏"拒掉。修后 8190 空载先 /free 再测。"""
+        import types
+
+        def _stub(free_seq, moss_q, freed):
+            return {
+                'comfy_queue_count': lambda: 0,
+                '_queue_count': lambda url, timeout=5: 0,
+                'vram_free_gb': lambda: free_seq.pop(0) if free_seq else 12.0,
+                'comfy_probe': lambda timeout=3: False,
+                'moss_probe': lambda timeout=3: True,
+                'moss_queue_count': lambda: moss_q,
+                'moss_free': lambda: (freed.append(1), True)[1],
+                'time': types.SimpleNamespace(sleep=lambda s: None),
+            }
+
+        def run(stubs):
+            old = {k: getattr(M, k) for k in stubs}
+            for k, v in stubs.items():
+                setattr(M, k, v)
+            try:
+                return M.moss_vram_gate()
+            finally:
+                for k, v in old.items():
+                    setattr(M, k, v)
+
+        # ① 8190 空载驻模(3.4G) → 先卸自己的残留(回 12G) → 放行
+        freed = []
+        self.assertIsNone(run(_stub([3.4, 12.0], 0, freed)))
+        self.assertEqual(len(freed), 1, '空载时应先卸 8190 自己的驻留模型')
+        # ② 8190 队列忙(别人在跑) → 不许动它, 照旧拒单(不动别人的负载)
+        freed2 = []
+        self.assertIn('大型游戏', run(_stub([3.4, 3.4, 3.4], 2, freed2)) or '')
+        self.assertEqual(freed2, [], '8190 队列忙时不该去 /free 它的模型')
 
 
 if __name__ == '__main__':

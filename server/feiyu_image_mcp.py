@@ -7,7 +7,14 @@ PC 用生图工作盘已验证的画风基线(coco 12 artist tag, 1108 定案)�
 过洗图硬闸(剥元数据) → 返回洗净图路径 → 桥 (qq-say.mjs --image) 发图。
 
 协议: 照抄 BWF MCP(18081) 的 streamable-HTTP JSON-RPC, 见 docs/肥鱼生图模块_设计稿_1110.md 第五节。
-监听: 127.0.0.1:18082 (只本机; 云上经 remote-proxy.py 17853→18082 Tailscale 中继)。
+监听: 127.0.0.1:18082 (只本机; 云上经 os 侧 -R 47853→127.0.0.1:18082 隧道)。
+
+双引擎(1113): gen_image 加 engine 参数 ——
+  "sdxl"(默认) = coco 画风基线, 走 8188, 角色预设/LoRA 全在这条线;
+  "moss"       = MOSS-Image 文字/版面引擎, 走 8190 (实例归属生图工作盘主线,
+                 G:\ComfyUI_moss, 1110 部署; 逐字文字/海报/多语种/漫画分格)。
+                 moss 无 LoRA 生态: 预设不生效, 提示词剥 SDXL 加权语法, 出图前与
+                 8188 显存互锁(两线满载挤爆 16G), 8190 空载 0 显存可随时拉起。
 
 红线(全硬编码, 无开关):
   1. 非 R18 双层闸 —— 负向焊死 nsfw/suggestive + 正向 R18 词黑名单拒单
@@ -52,6 +59,29 @@ COMFY_DIR = Path(r'G:\ComfyUI')
 COMFY_URL = 'http://127.0.0.1:8188'
 SEED_BASE = 109000            # 台账顺延新段
 SEED_USED_FILE = HERE / 'seed_used.json'
+
+# ── MOSS 引擎(1113 接入; 实例是生图工作盘主线的, 只调 HTTP API + 只读, 不改他家文件) ──
+MOSS_URL = 'http://127.0.0.1:8190'
+MOSS_DIR = Path(r'G:\ComfyUI_moss\ComfyUI')          # v0.44.0 源码实例, venv 在上一级
+MOSS_OUT = MOSS_DIR / 'output'
+MOSS_PREFIX_ROOT = 'feiyuOS_moss'                    # SaveImage 子目录前缀(在他家 output 里隔离)
+MOSS_NEG = ('nsfw, worst quality, bad anatomy, watermark, jpeg artifact, '
+            'multiple girls, two girls, crowd, extra characters, duplicate, '
+            'logo, username, artist name')   # 官方四件套+业务负向, 全平词(契约 §四.5)
+MOSS_W, MOSS_H = 1024, 1024                          # v1 固定 1M px(官方推荐档, ~60s/Mpx)
+MOSS_LIMIT = 1500                                    # MOSS 吃长词(官方 ~4K token), 只设滥用上限
+MOSS_RENDER_TIMEOUT = 600                            # 扩写 85s + 采样 ~120s + 首张加载
+MOSS_START_TIMEOUT = 180                             # owner 定案: 起服务等待 ≤180s(他家启动器自检同口径)
+MOSS_VRAM_MIN_GB = 8.5                               # MOSS 出图峰值 ~7.7G(1110 部署实测) + 余量
+QWEN_URL = 'http://127.0.0.1:8189'                   # 千问线; 哪天常驻与 MOSS 同档大显存, 进互锁(owner 1113 提醒)
+# 扩写指令 = _moss_boundary3.gen_expansion 的实证版(平铺键 + 指令写进 prompt;
+# 官方模板的 system_prompt 接线在本实例没验证过, 不冒险), 逐字文字保护加进去。
+MOSS_ENH_INSTR = (
+    'Rewrite the following text as one detailed English text-to-image prompt for MOSS-Image. '
+    'Describe subject, appearance, clothing, pose, setting, materials, colors, lighting, '
+    'framing and camera. Any wording the user wants displayed in the image must be kept '
+    'verbatim, in its original language, inside double quotes. Output only the prompt '
+    'itself, no explanation, no options, no markdown, no quotes.\n\nText: ')
 
 # ── 图回传(1110 夜; 她那边只读得到服务器本地文件, PC 的 G:\ 路径她读不到) ──
 #   出图后: PNG → JPEG(q95, 4:4:4, 与 G:\生图工作盘\洗图工具 同档) → scp 到服务器媒体目录。
@@ -327,6 +357,259 @@ def compose(subject, outfit='', scene='', preset_key=None):
     return pos, NEG_FIXED, None, (_key if preset else None)
 
 
+# ══ MOSS 引擎(1113, engine='moss') ═══════════════════════════
+def moss_compose(subject, outfit='', scene=''):
+    """MOSS 正向: 自然语言/tag 都吃, 但 SDXL 加权语法无效(1110 边界实测) → 剥权重。
+
+    不加 HEAD/ART(那是 SDXL 画风链, 与 MOSS 无关); 大肥鱼 LoRA 预设不适用
+    (MOSS 无 LoRA 生态)。中文原样保留(MOSS 双语)。返回 (pos, note, err)。
+    """
+    parts = []
+    for seg in (subject, outfit, scene):
+        seg = ' '.join((seg or '').split())
+        if seg:
+            parts.append(seg)
+    text = ', '.join(parts)
+    text = re.sub(r'\\([()\[\]])', r'\1', text)          # danbooru 转义括号还原
+    prev = None
+    while prev != text:                                   # (x:1.3) / ((x:1.3)) → x
+        prev = text
+        text = re.sub(r'\(([^():]{1,160}):\s*\d+(?:\.\d+)?\s*\)', r'\1', text)
+    text = re.sub(r'\s*,\s*', ', ', text).strip().rstrip(', ')
+    if len(text) > MOSS_LIMIT:
+        return None, None, ('描述过长(%d 字, MOSS 上限 %d): 请精简 subject'
+                            % (len(text), MOSS_LIMIT))
+    note = None
+    low = text.lower()
+    notes = []
+    if (('hand' in low or 'finger' in low)
+            and ('close-up' in low or 'closeup' in low or 'macro' in low)):
+        notes.append('MOSS 手部特写是硬伤(1110 实测六指), 手部近景建议改用默认引擎 sdxl')
+    # 契约 §四.4: 单页要渲染的正文 >~150 字 → 拒单(中段崩叠字), 建议拆块或转 sdxl。
+    # 判据 = 引号里的"要逐字画进图"的文字总长。
+    quoted = re.findall(r'"([^"]+)"', text) + re.findall(r'“([^”]+)”', text)
+    qtotal = sum(len(q) for q in quoted)
+    if qtotal > 150:
+        return None, None, ('要渲染进图里的文字共 %d 字, 超 MOSS 单页可靠上限(~150 字, '
+                            '中段会崩成叠字); 请拆块或改用 sdxl 引擎' % qtotal)
+    cjk = len(re.findall(r'[\u4e00-\u9fff]', text))
+    if not quoted and cjk > 200:
+        notes.append('提示词含 %d 个中文且没有引号: 未加引号的文字 MOSS 会自己编假字, '
+                     '要显示的文字请放进引号' % cjk)
+    note = '; '.join(notes) or None
+    return text, note, None
+
+
+def build_moss_api(pos, neg, seed, prefix, enhance=False):
+    """MOSS t2i 扁平 9 节点图(照 G:\\ComfyUI_moss\\_test_moss.py, 本实例已验证)。
+
+    enhance=True 追加 TextGenerate 扩写(opt-in; 契约 §五.3 本契约默认不用) ——
+    必须**平铺** sampling_mode.* 键(照 _moss_boundary3.gen_expansion; 嵌套对象能过
+    /prompt 校验但执行报 missing 1 required positional argument, 1110 实锤)。
+    """
+    g = {
+        '1': {'class_type': 'UNETLoader',
+              'inputs': {'unet_name': 'moss_image_sft_int8_convrot.safetensors',
+                         'weight_dtype': 'default'}},
+        '2': {'class_type': 'CLIPLoader',
+              'inputs': {'clip_name': 'qwen3.5_9b_w4a8_gptq.safetensors',
+                         'type': 'moss_image', 'device': 'default'}},
+        '3': {'class_type': 'VAELoader',
+              'inputs': {'vae_name': 'flux2-vae_small.safetensors'}},
+        '5': {'class_type': 'CLIPTextEncode', 'inputs': {'text': neg, 'clip': ['2', 0]}},
+        '6': {'class_type': 'EmptyFlux2LatentImage',
+              'inputs': {'width': MOSS_W, 'height': MOSS_H, 'batch_size': 1}},
+        '7': {'class_type': 'KSampler',
+              'inputs': {'model': ['1', 0], 'seed': seed, 'steps': 25, 'cfg': 2.5,
+                         'sampler_name': 'er_sde', 'scheduler': 'simple',
+                         'positive': ['4', 0], 'negative': ['5', 0],
+                         'denoise': 1.0, 'latent_image': ['6', 0]}},
+        '8': {'class_type': 'VAEDecode', 'inputs': {'samples': ['7', 0], 'vae': ['3', 0]}},
+        '9': {'class_type': 'SaveImage',
+              'inputs': {'images': ['8', 0], 'filename_prefix': prefix}},
+    }
+    if enhance:
+        g['10'] = {'class_type': 'TextGenerate', 'inputs': {
+            'clip': ['2', 0], 'prompt': MOSS_ENH_INSTR + pos, 'max_length': 1024,
+            'use_default_template': True, 'thinking': False,
+            'sampling_mode': 'on',
+            'sampling_mode.temperature': 0.7, 'sampling_mode.top_k': 64,
+            'sampling_mode.top_p': 0.95, 'sampling_mode.min_p': 0.05,
+            'sampling_mode.repetition_penalty': 1.05, 'sampling_mode.seed': seed}}
+        g['4'] = {'class_type': 'CLIPTextEncode',
+                  'inputs': {'text': ['10', 0], 'clip': ['2', 0]}}
+    else:
+        g['4'] = {'class_type': 'CLIPTextEncode',
+                  'inputs': {'text': pos, 'clip': ['2', 0]}}
+    return g
+
+
+def moss_probe(timeout=3):
+    try:
+        import urllib.request
+        with urllib.request.urlopen(MOSS_URL + '/system_stats', timeout=timeout):
+            return True
+    except Exception:                              # noqa
+        return False
+
+
+def moss_queue_count():
+    """8190 在跑+排队任务数; 服务器不在返回 None。"""
+    return _queue_count(MOSS_URL)
+
+
+def moss_free():
+    """卸 8190 模型归还显存。**别信部署文档的"空载 0 显存"** —— 1113 实测: 没跑过图的实例
+    0 显存, 但**跑过图的实例模型常驻 ~12.3G 不会自卸**(owner 验收: /free 后 vram_free 回落
+    14.53G)。所以每批跑完 /queue 空必须调这个, 否则下一单会被自己的驻留显存挡在闸外。
+    """
+    try:
+        _post('/free', {'unload_models': True, 'free_memory': True}, base=MOSS_URL)
+        _ledger({'tool': 'moss_free', 'ok': True})
+        return True
+    except Exception as e:                         # noqa
+        _ledger({'tool': 'moss_free', 'ok': False, 'err': str(e)[:120]})
+        return False
+
+
+_MOSS_PROC = None
+
+
+def ensure_moss():
+    """探活 → 按需拉起 8190(照他家 start_8190.bat 正文, DETACHED 脱离本进程树)。
+
+    与 8188 的差别: 8190 **空载 0 显存**(模型动态 staged), 起服务不抢卡,
+    所以不做直播闸/显存闸 —— 出图时的显存互锁单独走 moss_vram_gate()。
+    """
+    global _MOSS_PROC
+    if moss_probe():
+        return True, 'ok'
+    # 1113 owner 定案: 启动器归他家 —— start_8190_headless.cmd(幂等+自检)优先;
+    # 他落盘前回退本模块直启(命令与他家 bat 逐字一致, 双方等价, 他 ACK 过)。
+    headless = MOSS_DIR.parent / 'start_8190_headless.cmd'
+    log = (LOG / ('comfy8190_%s.log' % time.strftime('%m%d_%H%M%S'))).open('ab')
+    try:
+        if headless.exists():
+            _MOSS_PROC = subprocess.Popen(
+                ['cmd', '/c', str(headless)], stdout=log, stderr=subprocess.STDOUT,
+                creationflags=0x00000008 | 0x00000200)
+        else:
+            py = MOSS_DIR.parent / 'venv' / 'Scripts' / 'python.exe'
+            if not py.exists():
+                log.close()
+                return False, 'MOSS venv 不存在(%s): 实例未部署或被移动' % py
+            _MOSS_PROC = subprocess.Popen(
+                [str(py), '-B', '-s', 'main.py',
+                 '--listen', '127.0.0.1', '--port', '8190',
+                 '--disable-comfy-compiler', '--disable-api-nodes',
+                 '--preview-method', 'none'],
+                cwd=str(MOSS_DIR), stdout=log, stderr=subprocess.STDOUT,
+                creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
+    except Exception as e:                         # noqa
+        log.close()
+        return False, 'MOSS 8190 拉起失败: %s' % e
+    deadline = time.time() + MOSS_START_TIMEOUT
+    while time.time() < deadline:
+        if moss_probe():
+            return True, '拉起成功(%.0fs)' % (MOSS_START_TIMEOUT - (deadline - time.time()))
+        time.sleep(5)
+    return False, 'MOSS 8190 启动超时(%ds); 看 server/logs/comfy8190_*.log' % MOSS_START_TIMEOUT
+
+
+def moss_vram_gate():
+    """显存互锁: MOSS(~7.7G) 与 8188 SDXL(常驻 ~8.1G) 不能同时满载(1110 部署 §六)。
+
+    8188/8189 队列忙 → 拒单; 空闲但模型驻着(8188 SDXL **或 8190 自己**) → 先 /free 卸掉再测;
+    卸完仍不够 = 宿主在跑大型游戏 → 拒单。都没起 = 无冲突, 放行。
+    """
+    q = comfy_queue_count()
+    if q:
+        return ('8188 SDXL 队列还有 %d 个任务, 两线满载会挤爆 16G 显存; '
+                '等队列排空再试 MOSS' % q)
+    q8189 = _queue_count(QWEN_URL, timeout=3)
+    if q8189:
+        return ('8189 千问线队列还有 %d 个任务, 与 MOSS 同档大显存互锁; '
+                '等队列排空再试' % q8189)
+    free = vram_free_gb()
+    if free is not None and free < MOSS_VRAM_MIN_GB:
+        if comfy_probe():
+            comfy_free()                           # 8188 空闲但 SDXL 还驻着 → 先卸
+        # 1113 owner 反馈 B: 8190 自己跑完图模型常驻 ~12.3G(**queue=0 也占着**),
+        # 不先卸就会让下面那句判据误报"宿主在跑大型游戏" ——
+        # 同一实例的第二单必然被自己挡住。空载时先把它自己的残留卸掉再测。
+        if moss_probe() and not moss_queue_count():
+            moss_free()
+        time.sleep(3)
+        free = vram_free_gb()
+    if free is not None and free < MOSS_VRAM_MIN_GB:
+        return ('显存剩余 %.1f GiB(<%.1f, MOSS 出图峰值约 7.7G), 判定宿主在跑大型游戏; '
+                '请关游戏或稍后再试' % (free, MOSS_VRAM_MIN_GB))
+    return None
+
+
+def _wait_moss_file(prompt_id, seed, batch_name, timeout=MOSS_RENDER_TIMEOUT):
+    """轮询 8190 /history, 等 feiyuOS_moss/<批次>/fym_<seed>_*.png 落盘; 出错/超时 None。"""
+    import urllib.request
+    root = MOSS_OUT / MOSS_PREFIX_ROOT / batch_name
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(MOSS_URL + '/history/' + prompt_id,
+                                        timeout=10) as r:
+                hist = json.loads(r.read().decode('utf-8'))
+        except Exception:                          # noqa
+            continue
+        entry = hist.get(prompt_id)
+        if not entry:
+            continue
+        if (entry.get('status') or {}).get('status_str') == 'error':
+            return None
+        if root.exists():
+            hits = sorted(root.glob('fym_%d_*.png' % seed))
+            if hits:
+                return hits[-1]
+    return None
+
+
+def render_moss_batch(pos, neg, batch_dir, seeds, enhance=True):
+    """MOSS 渲染: 逐 seed 提交+轮询 → **拷贝**到本模块 raw/ → 洗图硬闸 → 洗净路径。
+
+    拷贝不挪: 他家 output 目录只增不改(1113 约定不动 G:\\ComfyUI_moss 内容)。
+    """
+    batch_dir = Path(batch_dir)
+    raw_dir = batch_dir / 'raw'
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for s in seeds:
+        api = build_moss_api(pos, neg, s,
+                             '%s/%s/fym_%d' % (MOSS_PREFIX_ROOT, batch_dir.name, s),
+                             enhance=enhance)
+        try:
+            r = _post('/prompt', {'prompt': api, 'client_id': CLIENT_ID}, base=MOSS_URL)
+        except Exception as e:                     # noqa
+            return {'ok': False,
+                    'reason': 'MOSS 提交失败(seed %d): %s; 看 server/logs/comfy8190_*.log'
+                              % (s, str(e)[:160])}
+        pid = r.get('prompt_id')
+        if not pid:
+            return {'ok': False,
+                    'reason': 'MOSS 提交无 prompt_id: %s'
+                              % json.dumps(r, ensure_ascii=False)[:200]}
+        f = _wait_moss_file(pid, s, batch_dir.name)
+        if f is None:
+            return {'ok': False,
+                    'reason': 'seed %d MOSS 渲染超时/出错(%ds); 8190 /history 自查'
+                              % (s, MOSS_RENDER_TIMEOUT)}
+        shutil.copyfile(str(f), str(raw_dir / f.name))
+    n_ok, fails = strip_gate(raw_dir, batch_dir)
+    images = []
+    for s in seeds:
+        images.extend(str(p) for p in sorted(batch_dir.glob('fym_%d_*.png' % s)))
+    return {'ok': n_ok > 0, 'engine': 'moss', 'images': images,
+            'batch_dir': str(batch_dir), 'seeds': seeds, 'washed': n_ok,
+            'washed_fail': [x[0] for x in fails]}
+
+
 # ══ 洗图硬闸(M2 先行) ═══════════════════════════════════════
 # 逻辑照抄 G:\生图工作盘\洗图工具\strip_meta.py(像素级无损重存, 已实战)。
 # raw/ 原图带 ComfyUI 的 tEXt prompt(完整节点图=明文), 永不出目录。
@@ -516,15 +799,20 @@ def vram_free_gb():
         return None
 
 
-def comfy_queue_count():
-    """8188 当前在跑+排队任务数; 服务器不在返回 None。"""
+def _queue_count(url, timeout=5):
+    """/queue 的 running+pending 总数; 服务器不在返回 None(8188/8189/8190 共用)。"""
     try:
         import urllib.request
-        with urllib.request.urlopen(COMFY_URL + '/queue', timeout=5) as r:
+        with urllib.request.urlopen(url + '/queue', timeout=timeout) as r:
             q = json.loads(r.read().decode('utf-8'))
         return len(q.get('queue_running') or []) + len(q.get('queue_pending') or [])
-    except Exception:
+    except Exception:                              # noqa
         return None
+
+
+def comfy_queue_count():
+    """8188 当前在跑+排队任务数; 服务器不在返回 None。"""
+    return _queue_count(COMFY_URL)
 
 
 def comfy_free():
@@ -563,8 +851,12 @@ def ensure_comfy():
     free = vram_free_gb()
     if free is None:
         return False, '无法确认显存余量(nvidia-smi 不可用), 保守起见不拉起'
+    if free < VRAM_MIN_GB and moss_probe() and _queue_count(MOSS_URL) == 0:
+        moss_free()          # MOSS 跑完残留 12.3G 常驻(契约 §二), 还给显存再判一次
+        time.sleep(3)
+        free = vram_free_gb()
     if free < VRAM_MIN_GB:
-        return False, ('显存剩余 %.1f GiB(<%.1f), 判定宿主在跑大型游戏/重载, '
+        return False, ('显存剩余 %.1f GiB(<%.1f), 判定宿主在跑大型游戏, '
                        '不拉起生图服务; 请关游戏或稍后再试' % (free, VRAM_MIN_GB))
     log = (LOG / ('comfy8188_%s.log' % time.strftime('%m%d_%H%M%S'))).open('ab')
     try:
@@ -613,14 +905,18 @@ HAND_NEG = (', fused fingers, too many fingers, missing fingers, extra digits, '
             'malformed hands, (toes:1.2), (feet instead of hands:1.2)')
 
 
-def _post(path, payload, timeout=30):
+def _post(path, payload, timeout=30, base=None):
     import urllib.request
     req = urllib.request.Request(
-        COMFY_URL + path,
+        (base or COMFY_URL) + path,
         data=json.dumps(payload).encode('utf-8'),
         headers={'Content-Type': 'application/json'}, method='POST')
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode('utf-8'))
+        body = r.read().decode('utf-8', 'ignore').strip()
+    # 1113 owner 反馈 A: ComfyUI /free 回 **200 + 空 body**, json.loads('') 抛
+    # JSONDecodeError → 动作其实生效了却记 ok:false(ledger 里那条 moss_free 假失败)。
+    # 空体一律按 {} 处理。
+    return json.loads(body) if body else {}
 
 
 def build_api(pos, neg, seed, batch_name, preset=None):
@@ -821,6 +1117,64 @@ def _ledger(evt):
         pass
 
 
+def _tool_gen_image_moss(subject, outfit, scene, count, seed, args):
+    """engine=moss 分支: 拒单闸已在 tool_gen_image 过过 → NL 正向 → 8190 生命周期。"""
+    # 契约 §五.3: TextGenerate 本契约不用 → 默认关; 显式 enhance=true 才走扩写(+85s)。
+    enhance = str(args.get('enhance', 'false')).lower() in ('1', 'true', 'yes', 'on')
+    pos, note, err = moss_compose(subject, outfit, scene)
+    if err:
+        return {'ok': False, 'reason': err}
+
+    def _alloc():
+        s = int(seed) if seed is not None else _next_seed(count)
+        bd = OUT_BASE / ('%s_%s' % (datetime.now().strftime('%m%d'), _slug(subject)))
+        (bd / 'raw').mkdir(parents=True, exist_ok=True)
+        return [s + i for i in range(count)], bd
+
+    if FAKE:
+        seeds, batch_dir = _alloc()
+        raw_dir = batch_dir / 'raw'
+        for s in seeds:
+            _fake_png(raw_dir / ('fym_%d_%06d.png' % (s, s)), subject + str(s))
+        n_ok, fails = strip_gate(raw_dir, batch_dir)
+        payload = {'ok': n_ok > 0, 'fake': True, 'engine': 'moss',
+                   'images': [str(p) for p in sorted(batch_dir.glob('fym_*.png'))],
+                   'batch_dir': str(batch_dir), 'washed': n_ok,
+                   'washed_fail': [f[0] for f in fails]}
+        if note:
+            payload['note'] = note
+        _publish_payload(payload)                  # 联调也走一遍回传, 不烧显卡就能验链路
+        _ledger({'tool': 'gen_image', 'engine': 'moss', 'fake': True,
+                 'ok': payload['ok'], 'washed': n_ok})
+        return payload
+
+    ok_moss, why = ensure_moss()
+    if not ok_moss:
+        _ledger({'tool': 'gen_image', 'engine': 'moss', 'ok': False, 'reject': why})
+        return {'ok': False, 'reason': why}
+    gate = moss_vram_gate()
+    if gate:
+        _ledger({'tool': 'gen_image', 'engine': 'moss', 'ok': False, 'reject': gate})
+        return {'ok': False, 'reason': gate}
+    seeds, batch_dir = _alloc()
+    payload = render_moss_batch(pos, MOSS_NEG, batch_dir, seeds, enhance=enhance)
+    # 8190 跑完模型常驻 12.3G 不会自卸(契约 §二)。⚠ /queue 清空有滞后: 刚落盘就查
+    # 常常还剩 running(E2E-2 实锤 12026MiB 残留) → 带重试收尾, 24s 内清空才 free。
+    for _ in range(3):
+        if moss_queue_count() == 0:
+            moss_free()                            # 兜底卸模, 失败只记账不报错
+            break
+        time.sleep(8)
+    if note:
+        payload['note'] = note
+    _publish_payload(payload)
+    _ledger({'tool': 'gen_image', 'engine': 'moss', 'ok': payload.get('ok', False),
+             'batch_dir': str(batch_dir), 'seeds': seeds, 'enhance': enhance,
+             'washed': payload.get('washed'), 'washed_fail': payload.get('washed_fail'),
+             'publish': payload.get('publish')})
+    return payload
+
+
 def tool_gen_image(args):
     gap = time.time() - _LAST_GEN_TS[0]
     if _LAST_GEN_TS[0] and gap < MIN_SEND_INTERVAL:
@@ -845,6 +1199,12 @@ def tool_gen_image(args):
         _ledger({'tool': 'gen_image', 'ok': False, 'reject': why})
         return {'ok': False, 'reason': why}
 
+    engine = (args.get('engine') or 'sdxl').strip().lower()
+    if engine not in ('sdxl', 'moss'):
+        return {'ok': False, 'reason': "engine 只支持 'sdxl' / 'moss'"}
+    if engine == 'moss':
+        return _tool_gen_image_moss(subject, outfit, scene, count, seed, args)
+
     pos, neg, err, preset_key = compose(subject, outfit, scene)
     if err:
         return {'ok': False, 'reason': err}
@@ -864,8 +1224,7 @@ def tool_gen_image(args):
         for s in seeds:
             _fake_png(raw_dir / ('fyi_%d_%06d.png' % (s, s)), subject + str(s))
         n_ok, fails = strip_gate(raw_dir, batch_dir)
-        images = [str(batch_dir / p.name) for p in sorted(batch_dir.iterdir())
-                  if p.suffix.lower() == '.png']
+        images = [str(batch_dir / p.name) for p in sorted(batch_dir.glob('fyi_*.png'))]
         payload = {'ok': n_ok > 0, 'fake': True, 'images': images, 'batch_dir': str(batch_dir),
                    'pos_len': len(pos), 'washed': n_ok, 'washed_fail': [f[0] for f in fails]}
         _publish_payload(payload)                  # 联调也走一遍回传, 不烧显卡就能验链路
@@ -914,6 +1273,7 @@ def tool_gen_image_status(_args):
     free = vram_free_gb()
     return {'ok': True, 'fake_mode': FAKE, 'comfy_online': comfy_probe(),
             'comfy_queue': comfy_queue_count(), 'live_now': is_live_now(),
+            'moss_online': moss_probe(), 'moss_queue': moss_queue_count(),
             'vram_free_gb': round(free, 1) if free is not None else None,
             'vram_min_gb': VRAM_MIN_GB,
             'style': STYLE_ENUM[0], 'today_batches': batches,
@@ -923,19 +1283,28 @@ def tool_gen_image_status(_args):
 
 TOOLS = [
     {'name': 'gen_image',
-     'description': '画一张(非 R18)动漫插画。固定使用团队已验证的画风基线(不可换风格)。'
-                    '参数全部用英文 danbooru tag(由你翻译, 不收中文); subject 必填'
-                    '(角色+动作/构图), outfit/scene 可选, count 1~4 默认 2。'
-                    '画大肥鱼(DS娘, 即你自己)时: subject 必须带身份词 "whale maid"'
-                    '(丢了它路由不到她的 LoRA, 会画成普通女孩); '
-                    '要 Q 版二头身再写 "chibi", 要女仆原版再写 "maid version", '
-                    '两个都不写默认 Q 版。画别人(铃兰/可莉等)时不要带这些词。'
+     'description': '画图(非 R18), 双引擎。固定画风基线(不可换风格)。'
                     '红线: R18 词与真人声优/偶像名字一律拒单。'
+                    'engine 默认 "sdxl" = coco 画风基线: 画角色立绘/普通插画/大肥鱼(DS娘), '
+                    '参数用英文 danbooru tag; subject 必填(角色+动作/构图), outfit/scene 可选; '
+                    '画大肥鱼时 subject 必须带 "whale maid"(丢了路由不到她的 LoRA), '
+                    '要 Q 版写 "chibi", 要女仆原版写 "maid version", 都不写默认 Q 版。'
+                    'engine "moss" = MOSS-Image 文字引擎: 适合带文字的海报/菜单/招牌/贺卡'
+                    '(图里的字会逐字画对)与精确排版; 不适合手部特写、超过约150字的整页文字。'
+                    'moss 时 subject 直接写英文自然语言或 tag(服务端拼 NL, 不用学新语法), '
+                    '要显示的文字放进引号逐字写(单页引号正文>150字拒单); '
+                    '不带角色 LoRA(大肥鱼预设只对 sdxl 生效); '
+                    'enhance=true(默认)先自动扩写提示词, 多花约 85 秒。'
                     '返回 JSON: ok/reason/images(洗净版绝对路径, 可直接发图)/batch_dir。',
      'inputSchema': {'type': 'object', 'properties': {
-         'subject': {'type': 'string', 'description': '画什么(英文 danbooru tag: 角色+动作/构图)'},
-         'outfit': {'type': 'string', 'description': '服装描述(英文 tag, 可省略)'},
-         'scene': {'type': 'string', 'description': '场景/光线(英文 tag, 可省略)'},
+         'subject': {'type': 'string', 'description': '画什么(英文; sdxl 用 danbooru tag, moss 用自然语言/tag)'},
+         'outfit': {'type': 'string', 'description': '服装描述(英文, 可省略)'},
+         'scene': {'type': 'string', 'description': '场景/光线(英文, 可省略)'},
+         'engine': {'type': 'string', 'enum': ['sdxl', 'moss'],
+                    'description': '出图引擎, 默认 sdxl。带逐字文字的海报/菜单/招牌用 moss'},
+         'enhance': {'type': 'boolean',
+                     'description': '仅 engine=moss 有效: TE 扩写提示词(约 +85s); 默认关, '
+                                    '短词/构图随机时建议显式开'},
          'count': {'type': 'integer', 'description': '出几张 1~4, 默认 2'},
          'seed': {'type': 'integer', 'description': '种子(复现用, 可省略)'},
      }, 'required': ['subject']}},
@@ -991,7 +1360,7 @@ class McpHandler(BaseHTTPRequestHandler):
             while len(SESSIONS) > 4096:
                 SESSIONS.pop(next(iter(SESSIONS)), None)
             result = {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}},
-                      'serverInfo': {'name': 'feiyu-image-mcp', 'version': '0.2.0'}}
+                      'serverInfo': {'name': 'feiyu-image-mcp', 'version': '0.3.1'}}
         elif method == 'notifications/initialized':
             self._send(202, b'')                   # 无响应体
             return
